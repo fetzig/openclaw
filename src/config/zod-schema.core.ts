@@ -1,6 +1,7 @@
 import path from "node:path";
 import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
 import { z } from "zod";
+import { parseDurationMs } from "../cli/parse-duration.js";
 import { isSafeExecutableValue } from "../infra/exec-safety.js";
 import { normalizeExactAllowedHost } from "../secrets/exact-hostname.js";
 import { ENV_SECRET_REF_ID_RE, SECRET_PROVIDER_ALIAS_PATTERN } from "../secrets/ref-contract.js";
@@ -127,8 +128,30 @@ export const SecretProviderSchema = z.union([
   SecretsStoreProviderSchema,
 ]);
 
+export const UserVaultConfigSchema = z.strictObject({
+  enabled: z.boolean().optional(),
+  exposureTtl: z
+    .union([
+      z.literal(0),
+      z.string().refine((value) => {
+        if (value === "0") {
+          return true;
+        }
+        try {
+          return parseDurationMs(value) > 0;
+        } catch {
+          return false;
+        }
+      }, "Expected a positive duration or 0."),
+    ])
+    .optional(),
+  maxEntries: z.number().int().positive().optional(),
+  maxBytes: z.number().int().positive().optional(),
+});
+
 export const SecretsConfigSchema = z
   .strictObject({
+    userVault: UserVaultConfigSchema.optional(),
     egressProxy: z
       .strictObject({
         enabled: z.boolean().optional(),

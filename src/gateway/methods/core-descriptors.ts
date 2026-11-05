@@ -14,6 +14,8 @@ import {
 import type { CoreGatewayMethodSpecRow } from "./core-descriptor-types.js";
 import { cronListShareKey, modelsListShareKey, operatorReadShareKey } from "./read-share-keys.js";
 
+const USER_VAULT_WRITE = { ...PROFILE_DEPENDENT, ...CONTROL_PLANE_WRITE };
+
 // Canonical append-only method table; derived lookup and dispatch policy lives in core-method-policy.ts.
 // This is the canonical core method policy table: every core handler must appear here so
 // listing, authorization, startup availability, and write throttling stay in sync.
@@ -749,4 +751,7 @@ export const CORE_GATEWAY_METHOD_SPECS = [
   ["users.channelIdentity", "users", "operator.sessions.read", "2026.10", PROFILE_DEPENDENT],
   ["sessions.groups.create", "sessions-groups", "operator.write", "2026.10"],
   ["sessions.catalog.resolve", "session-catalog", "operator.read", "2026.10"],
+  ["userVault.list", "user-vault", "operator.read", "2026.10", PROFILE_DEPENDENT],
+  ["userVault.set", "user-vault", "operator.read", "2026.10", USER_VAULT_WRITE],
+  ["userVault.delete", "user-vault", "operator.read", "2026.10", USER_VAULT_WRITE],
 ] as const satisfies readonly CoreGatewayMethodSpecRow[];

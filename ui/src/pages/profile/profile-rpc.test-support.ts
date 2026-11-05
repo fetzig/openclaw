@@ -24,6 +24,9 @@ export const disconnectedGitHub = {
 };
 export function mockRpc(handlers: Record<string, (params?: unknown) => unknown>) {
   return vi.fn(async (method: string, params?: unknown) => {
+    if (method === "userVault.list" && !Object.hasOwn(handlers, method)) {
+      return { entries: [] };
+    }
     if (method === "users.channelIdentity" && !Object.hasOwn(handlers, method)) {
       return { status: "ok", accounts: [] };
     }

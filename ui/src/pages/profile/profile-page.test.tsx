@@ -153,6 +153,7 @@ it("renders identity before Usage statistics and opens the usage page", async ()
   await waitForFast(() =>
     expect(request.mock.calls.map(([method]) => method).toSorted()).toEqual(
       [
+        "userVault.list",
         "users.self",
         "users.listModelAccounts",
         "users.prefs.get",

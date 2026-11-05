@@ -27,6 +27,15 @@ export const CORE_FIELD_HELP: Record<string, string> = {
     "Explicit key/value environment variable overrides merged into runtime process environment for OpenClaw. Use this for predictable environment configuration instead of relying only on shell profile side effects.",
   secrets:
     "Secret reference providers, shared-store behavior, and optional subprocess egress protection.",
+  "secrets.userVault":
+    "Personal vault storage and explicit session exposure. Values reach command processes only after the user enables exposure.",
+  "secrets.userVault.enabled":
+    "Enable the personal user vault (default: true). Disabled blocks vault management and exposure.",
+  "secrets.userVault.exposureTtl":
+    "Maximum lifetime of a vault exposure (default: 1h). Set 0 for no expiry.",
+  "secrets.userVault.maxEntries": "Maximum entries per personal user vault (default: 100).",
+  "secrets.userVault.maxBytes":
+    "Maximum total UTF-8 value bytes per user vault (default: 1048576).",
   "secrets.egressProxy":
     "Gateway-owned loopback proxy that replaces shared-store secret sentinels only at outbound request time. Restart the Gateway after changing this startup-scoped section.",
   "secrets.egressProxy.enabled":

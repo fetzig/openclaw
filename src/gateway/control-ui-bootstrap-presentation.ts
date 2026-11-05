@@ -20,6 +20,7 @@ export function resolveControlUiBootstrapPresentation(config: OpenClawConfig | u
       config?.gateway?.controlUi?.experimental?.composerPredictions?.enabled === true,
     communityInvite: config?.gateway?.controlUi?.communityInvite !== false,
     newSessionModelDefaults: config?.gateway?.controlUi?.newSessionModelDefaults ?? "last-used",
+    userVaultEnabled: config?.secrets?.userVault?.enabled !== false,
     uploadsEnabled: config?.gateway?.uploads?.enabled !== false,
   } satisfies Partial<ControlUiBootstrapConfig>;
 }

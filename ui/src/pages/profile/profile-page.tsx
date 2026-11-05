@@ -57,6 +57,7 @@ import { PersonalInstructions } from "./personal-instructions.tsx";
 import { userProfileAvatarUrl } from "./profile-avatar-url.ts";
 import { ProfileHero } from "./profile-hero.tsx";
 import { type IdentityChange, ProfileState } from "./profile-state.ts";
+import { UserVault } from "./user-vault.tsx";
 
 registerRouteSubtitlesEnglish();
 
@@ -622,6 +623,7 @@ export function ProfilePage() {
                   : null
               }
             />
+            <UserVault />
             <GitHubConnections />
             <AttributionSection />
           </Show>

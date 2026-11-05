@@ -5,6 +5,19 @@ const identity = en.profilePage.identity;
 
 const enProfile = {
   profilePage: {
+    userVault: {
+      title: "User vault",
+      description:
+        "Personal environment secrets. Expose them to a session only from its Details pane. Stored values are never shown here.",
+      loading: "Loading your vault…",
+      empty: "Your vault is empty.",
+      name: "Environment variable name",
+      value: "Secret value",
+      save: "Save secret",
+      remove: "Delete",
+      warning:
+        "Values are unencrypted at rest and readable by host administrators. Exposed commands can print or persist them. Revocation does not stop existing processes or remove credential files.",
+    },
     discord: {
       title: "Discord account",
       description:

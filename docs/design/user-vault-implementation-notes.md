@@ -17,8 +17,9 @@ in the Codex harness documentation: personal values may reach command processes,
 but must never reach model-facing context or a Codex app-server process.
 
 GitHub prerequisite: the managed `github_identity_status` tool reports an available
-GitHub-API-verified `fetzig` identity with `repo` scope. The bare GitHub CLI has no
-authentication in this worker; that does not describe the managed identity.
+GitHub-API-verified `fetzig` identity with `repo` scope. The initial bare GitHub CLI lacked
+authentication; subsequent checks on 2026-11-04 and in the restored checkout on
+2026-11-05 returned `fetzig` and repository push permission `true` (both exit 0).
 `git push --dry-run origin HEAD:feat/personal-vault-worker-exec` succeeded. The
 identity tool reports repository grants as unknown; the dry-run is transport
 evidence, not a repository permissions API result. Actual pushes will be verified
@@ -41,8 +42,12 @@ against the remote ref after each commit.
   and implementation section override that: retain the exact dispatched base.
 - The plan mentions an issue/design note. Only this design note is authorized;
   never create the issue or a PR.
-- Reuse the existing host-env denylist without vault-specific additions. A key
-  such as `GH_TOKEN` may be stored; binding and launcher environment wins at use.
+- Reuse the existing host-env denylist without vault-specific additions. The dispatched base
+  already blocks `GH_TOKEN`/`GITHUB_TOKEN` as override-only keys in
+  `src/infra/host-env-security-policy.json`, contradicting the plan’s example.
+  Preserve that existing policy: those names are rejected, without adding any
+  vault-only denylist entries. Binding/launcher precedence still applies to
+  otherwise accepted keys.
 - Existing prepared exec logic includes team-store values in `requestedEnv`. Do
   not reuse that carrier for vault values: introduce an execution-only layer and
   preserve the team-store behavior unchanged.
@@ -61,6 +66,8 @@ against the remote ref after each commit.
 - Scope exposure by the session store/target as well as session identity to avoid
   accidental cross-agent/store key collisions. UI events contain holder display
   identity and mode/expiry, not entry names or values.
+- Values containing NUL bytes are rejected because process environments cannot
+  represent them. This is value validation, not a vault-specific name denylist.
 - Snapshots are per binding. An edit does not modify an already bound turn.
   Revocation blocks future launches but does not kill or scrub running processes.
 
@@ -96,3 +103,50 @@ revocation for later turns/users. Durable exec stores launch environment in
 systemd unit properties readable by the Gateway Unix user. Existing processes
 retain their environment after expiry/revocation. Devices sharing a verified
 profile are one user. These limits must be visible in the user-facing vault page.
+
+## Review and recovery status (2026-11-05)
+
+Independent review: **not performed**. Klemens explicitly authorized proceeding
+without independent review for these fork commits. Nix will review the pushed
+commits with Opus; that future review is not claimed as completed evidence.
+No reviewer agents, PRs, issues, or production changes have been created.
+
+The restored checkout contained all 24 uncommitted commit-1 files. Its local
+HEAD had reverted to the dispatched base, while the remote retained design
+commit `726b79354db87eabe114e47d2c8a1a56226dc78d`. Restored that existing
+ancestry without rebasing or rewriting remote history; SHA-256 checks verified
+all 24 working-file contents were unchanged. Previous interrupted build and
+typecheck commands have no live sessions in this restored worker. Their final
+results are unknown and are not counted as passes. Re-run focused checks here.
+
+Commit 1 implements storage, self-only metadata/write/delete RPCs, config and
+help, and the Profile vault section. Exposure and execution injection are not
+yet implemented, and no live end-to-end acceptance claim is made.
+
+### Commit-1 verification in restored checkout
+
+- Focused backend tests: 101 passed across seven files (vault/model-account
+  storage, RPC authorization, config, method discovery, and profile policies).
+- Profile and vault UI regressions: 28 passed across two files.
+- `pnpm tsgo:core` and `pnpm tsgo:ui`: passed.
+- Focused core and UI oxlint: passed, zero warnings/errors. The pinned Bun
+  download was unavailable; the repository-supported Node/oxlint fallback ran.
+- Formatting and `git diff --check`: passed.
+- `pnpm build:runtime`: completed with exit 0, including runtime source checks,
+  bundling, CLI import guard, plugin assets, and UI build. The UI asset report
+  reported advisory violations for startup JS, total CSS, chat boot JS, and new
+  boot JS. These are not claimed clean or attributed to this change without a
+  base comparison. The full declaration/package build was not re-run.
+- These are unit/synthetic/static/build results, not live two-user acceptance.
+  Before/after UI screenshots and the end-to-end execution matrix remain open.
+
+The pre-commit freshness gate initially refused the commit because the restored
+checkout has no `origin/main` and the intentional config surface grew by five
+paths. Used the supported `PROTOCOL_SINCE_BASE_SHA` override with the exact
+dispatched base, not a newer upstream reference. `pnpm protocol:check` passed
+for all three new methods. Ran `pnpm config:docs:gen` and its check; the generated
+core count increases from 2586 to 2591 for the requested `secrets.userVault`
+container plus enabled, exposureTtl, maxEntries, and maxBytes. Channel/plugin
+budgets are unchanged. This intentional growth supports the explicitly
+requested opt-in feature and per-user limits; no unrelated config was removed
+to hide the increase. Only the small tracked count/hash artifacts are committed.

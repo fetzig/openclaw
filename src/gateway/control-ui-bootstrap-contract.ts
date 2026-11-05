@@ -102,6 +102,7 @@ export type ControlUiBootstrapConfig = {
   terminalEnabled?: boolean;
   /** Whether clients may upload files and images (`gateway.uploads.enabled`). */
   uploadsEnabled?: boolean;
+  userVaultEnabled?: boolean;
   /** Whether the Labs-gated CLI agents model-picker group is enabled. */
   cliAgentsEnabled?: boolean;
   /** Only explicit no-auth Gateways permit native asset loading without scoped cookies. */

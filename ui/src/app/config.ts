@@ -36,6 +36,7 @@ type ApplicationConfig = {
   newSessionModelDefaults?: "last-used" | "configured" | null;
   terminalEnabled: boolean;
   uploadsEnabled: boolean;
+  userVaultEnabled?: boolean;
   cliAgentsEnabled?: boolean;
   pluginAssetsRequireAuth: boolean;
   pluginFrameGrants: ControlUiPluginFrameGrantAck[];
@@ -77,6 +78,7 @@ const DEFAULT_APPLICATION_CONFIG: ApplicationConfig = {
   newSessionModelDefaults: null,
   terminalEnabled: readDocumentTerminalEnabled() ?? false,
   uploadsEnabled: true,
+  userVaultEnabled: true,
   cliAgentsEnabled: false,
   pluginAssetsRequireAuth: true,
   pluginFrameGrants: [],
@@ -132,6 +134,7 @@ function normalizeApplicationConfig(parsed: ControlUiBootstrapConfig): Applicati
     newSessionModelDefaults: parsed.newSessionModelDefaults ?? "last-used",
     terminalEnabled: Boolean(parsed.terminalEnabled),
     uploadsEnabled: parsed.uploadsEnabled !== false,
+    userVaultEnabled: parsed.userVaultEnabled !== false,
     cliAgentsEnabled: Boolean(parsed.cliAgentsEnabled),
     pluginAssetsRequireAuth: parsed.pluginAssetsRequireAuth !== false,
     pluginControlUiModules: parsed.pluginControlUiModules ?? [],
