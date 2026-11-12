@@ -63,7 +63,11 @@ import { createReplyInputAdmission } from "./reply-input-admission.js";
 import * as replyRunState from "./reply-operation-run-state.js";
 import { bindReplyOperationTyping } from "./reply-run-typing.js";
 import { enqueueReplySourceAdmission } from "./reply-source-admission.js";
-import { bindReplySourceToFollowup, retireUnadoptedReplySource } from "./reply-source-binding.js";
+import {
+  bindReplySourceToFollowup,
+  isReplyHumanIngress,
+  retireUnadoptedReplySource,
+} from "./reply-source-binding.js";
 import { prepareReplyRunToolAuthority } from "./reply-tool-authority.js";
 import { runWithReplyOperationLifecycleAdmission } from "./reply-turn-admission-lifecycle.js";
 import { resolveReplyTurnKind } from "./reply-turn-kind.js";
@@ -107,6 +111,8 @@ export async function runReplyAgent(
   const controllerInput = submitSessionControllerInput(queueKey, followupRun, resolvedQueue, {
     protocolRunId: runId,
     storePath,
+    // Used only when ingress prepared no reply source (its context had no SessionKey).
+    adapter: { humanIngress: isReplyHumanIngress(opts) },
   });
   let immediateClaim: SessionControllerMailboxClaim | undefined;
   const upstreamSignals = [

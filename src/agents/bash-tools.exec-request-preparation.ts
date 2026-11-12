@@ -437,6 +437,8 @@ export function resolvePreparedExecEnvironment(params: {
 }): {
   env: Record<string, string>;
   requestedEnv?: Record<string, string>;
+  /** Names a requester grant may not set at launch; names only, never values. */
+  reservedKeys: string[];
   executionContext?: SystemRunExecutionContext;
 } {
   if (params.localProcessEnv && params.host !== "gateway") {
@@ -609,6 +611,9 @@ export function resolvePreparedExecEnvironment(params: {
 
   return {
     env: executionEnv,
+    reservedKeys: [explicitEnv, preparedEnv, routingEnv, gitPolicyEnv].flatMap((source) =>
+      Object.keys(source ?? {}),
+    ),
     ...(params.host === "node" && routingEnv ? { executionContext } : {}),
     ...(params.host !== "node" && Object.keys(preparedEnv).length > 0
       ? { requestedEnv: { ...forwardedEnv, ...preparedEnv } }

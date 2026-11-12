@@ -22,6 +22,11 @@ export type TrustedAgentToolCaller = Readonly<{
   executionIdentityToken?: ExecutionIdentityAdmissionToken;
   /** Exact admitted requester lifetime; identity alone does not establish live authority. */
   assertCurrent?: () => void;
+  /**
+   * Inter-session input's sender for the requester-grant breaker: the sending run's admitted
+   * operator, captured host-side when the tool runs (undefined profile: no verified operator).
+   */
+  requesterGrantSender?: Readonly<{ profileId: string | undefined }>;
 }>;
 
 /** Closure-bound streaming hooks attached only to trusted plugin-owned synthetic clients. */

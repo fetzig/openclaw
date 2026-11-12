@@ -64,7 +64,9 @@ export function resolveExecLaunchEnv(
   env: NodeJS.ProcessEnv | undefined,
   sandboxed: boolean,
   grantEnv?: Record<string, string>,
+  requesterEnv?: Record<string, string>,
 ): NodeJS.ProcessEnv | undefined {
   const launchEnv = env && !sandboxed ? omitGatewayCredentialEnv(env) : env;
-  return grantEnv ? { ...launchEnv, ...grantEnv } : launchEnv;
+  // Egress proxy settings are OpenClaw-owned and win over requester grant keys.
+  return grantEnv || requesterEnv ? { ...launchEnv, ...requesterEnv, ...grantEnv } : launchEnv;
 }

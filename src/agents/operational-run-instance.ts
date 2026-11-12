@@ -6,6 +6,20 @@ export type OperationalRunInstanceRef = Readonly<{
   runId: string;
 }>;
 
+let lastRunSequence = 0;
+const runSequences = new WeakMap<OperationalRunInstanceRef, number>();
+
 export function createOperationalRunInstanceRef(runId: string): OperationalRunInstanceRef {
-  return Object.freeze({ instanceId: randomUUID(), runId });
+  const ref = Object.freeze({ instanceId: randomUUID(), runId });
+  runSequences.set(ref, ++lastRunSequence);
+  return ref;
+}
+
+/** Creation order only: a value created at sequence N precedes every run with a higher number. */
+export function readOperationalRunSequence(ref: OperationalRunInstanceRef): number | undefined {
+  return runSequences.get(ref);
+}
+
+export function currentOperationalRunSequence(): number {
+  return lastRunSequence;
 }

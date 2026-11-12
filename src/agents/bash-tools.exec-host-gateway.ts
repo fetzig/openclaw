@@ -1100,6 +1100,7 @@ export async function processGatewayAllowlist(
               workdir: params.workdir,
               env: params.env,
               secretEgressBindings: params.secretEgressBindings,
+              requesterGrantReservedKeys: params.requesterGrantReservedKeys,
               durable: params.durable,
               sessionId: params.sessionId,
               githubProfileDir: params.githubProfileDir,

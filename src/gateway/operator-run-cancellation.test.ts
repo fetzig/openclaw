@@ -284,6 +284,9 @@ describe("operator access cancellation", () => {
       const guest = await f.register("retained-invocation");
       const release = vi.fn();
       const retained = await guest.retain({ assertCurrent: () => {}, release });
+      // The requester-grant breaker reads the verified sender from the RPC source.
+      expect(guest.entry.adapter.requesterProfileId).toBe(retained.authority!.profileId);
+      expect(guest.entry.adapter.humanIngress).toBe(true);
       const releaseChild = retained.authority!.retain!();
       try {
         retained.release();

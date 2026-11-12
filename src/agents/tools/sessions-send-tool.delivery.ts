@@ -208,6 +208,10 @@ export async function trySessionsSendActiveRunDelivery(
   SessionsSendStart | { fallbackSessionKey?: string; callGateway?: AgentToolGatewayRequestCaller }
 > {
   const assertCaller = captureGatewayToolCallerAssertion();
+  // The sending run's admitted operator, never the model-selected `user` participant.
+  const requesterGrantSender = {
+    profileId: getGatewayToolCallerIdentity()?.operatorAuthority?.profileId,
+  };
   try {
     const selection = resolveGatewayToolOperatorSelection({ requireRequesterOrigin: true });
     selection.assertCurrent();
@@ -318,6 +322,7 @@ export async function trySessionsSendActiveRunDelivery(
           // A status-only inter-session input cannot abort the receiving turn.
           abortOnUnconfirmedTranscript: false,
           options: queueOptions,
+          requesterGrantSender,
         });
       };
       const steer = selection.operatorAuthority
@@ -452,6 +457,7 @@ export async function startSessionsSendAgentRun(
               agentId: caller.agentId,
               sessionKey: caller.sessionKey,
               requesterOrigin: selection.requesterOrigin,
+              requesterGrantSender: { profileId: caller.operatorAuthority?.profileId },
             },
           }
         : {}),

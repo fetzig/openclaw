@@ -69,6 +69,7 @@ import type { DurableExecOptions } from "./bash-tools.exec-types.js";
 import type { BashSandboxConfig } from "./bash-tools.shared.js";
 import { chunkString, clampWithDefault, readEnvInt } from "./bash-tools.shared.js";
 import type { ExecApprovalTransport } from "./exec-approval-transport.js";
+import { resolveRequesterGrantLaunch } from "./requester-grants.js";
 import { recordAgentCleanupFailure } from "./run-cleanup-timeout.js";
 import type { AgentToolResult } from "./runtime/index.js";
 import { createStreamingBinaryOutputSanitizer } from "./shell-utils.js";
@@ -217,6 +218,7 @@ export async function runExecProcess({
   workdir: string;
   env: Record<string, string>;
   secretEgressBindings?: readonly SecretEgressSentinelBinding[];
+  requesterGrantReservedKeys?: readonly string[];
   /** Host-selected managed profile; never inferred from the requested environment. */
   githubProfileDir?: string;
   pathPrepend?: string[];
@@ -260,7 +262,8 @@ export async function runExecProcess({
       : (requestSignal ?? initialStartupSignal);
   let assertSourceActive: SessionSourceAssertion | undefined =
     captureAgentToolSourceExecutionGuard(startupSignal);
-  let operatorAuthority = getGatewayToolCallerIdentity()?.operatorAuthority;
+  const caller = getGatewayToolCallerIdentity();
+  let operatorAuthority = caller?.operatorAuthority;
   const operatorSignal = operatorAuthority?.signal;
   let releaseOperatorAuthority: (() => void) | undefined;
   const startedAt = Date.now();
@@ -577,10 +580,12 @@ export async function runExecProcess({
       const assertOperatorCurrent = operatorAuthority?.assertCurrent;
       const assertRuntimeCurrent = assertSandboxCurrent;
       const assertHostPolicyCurrent = assertPolicyCurrent;
+      let vault: Awaited<ReturnType<typeof resolveRequesterGrantLaunch>>;
       const assertCurrent = () => {
         assertSourceCurrent?.();
         assertOperatorCurrent?.();
         assertRuntimeCurrent?.();
+        vault?.assertCurrent();
       };
       // Source authority covers construction; approval policy ends at native launch.
       assertCurrent();
@@ -595,6 +600,7 @@ export async function runExecProcess({
         : undefined;
       secretEgressGrant = grant;
       try {
+        vault = await resolveRequesterGrantLaunch(caller, opts);
         if (opts.durable) {
           const { startDurableExecProcess } = await import("./bash-process-durable.js");
           return await startDurableExecProcess(
@@ -614,7 +620,7 @@ export async function runExecProcess({
           withoutGatewayToolCallerIdentity(() =>
             supervisor.spawn({
               ...input,
-              env: resolveExecLaunchEnv(input.env, Boolean(opts.sandbox), grant?.env),
+              env: resolveExecLaunchEnv(input.env, Boolean(opts.sandbox), grant?.env, vault?.env),
               onCancel: () => {
                 beginSandboxTermination();
                 grant?.revoke();

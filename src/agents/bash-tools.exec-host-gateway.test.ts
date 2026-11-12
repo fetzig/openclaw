@@ -36,11 +36,14 @@ import { createProcessSupervisor } from "../process/supervisor/supervisor.js";
 import type { ProcessSupervisor } from "../process/supervisor/types.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { expectNoCalls } from "../test-utils/mock-call-assertions.js";
+import { createAdmittedRunOperatorAuthority } from "./admitted-run-context.js";
 import { resetProcessRegistryForTests } from "./bash-process-registry.test-support.js";
 import type { ExecApprovalFollowupOutcome } from "./bash-tools.exec-result.types.js";
 import { captureProcessUnhandledRejections } from "./bash-tools.exec-runtime.test-support.js";
 import type { ExecApprovalFollowupFactory } from "./bash-tools.exec-types.js";
+import { createOperationalRunInstanceRef } from "./operational-run-instance.js";
 import { captureSecurityEvents } from "./test-helpers/security-events.js";
+import { withGatewayToolCallerIdentity } from "./tools/gateway-caller-context.js";
 
 type SendExecApprovalFollowupResult =
   typeof import("./bash-tools.exec-host-shared.js").sendExecApprovalFollowupResult;
@@ -1408,6 +1411,150 @@ describe("processGatewayAllowlist", () => {
     await vi.waitFor(() => expect(approvalDecisionMock).toHaveBeenCalledOnce());
     expectNoCalls(commitAuthorizationMock, runExecProcessMock, followupMock);
   });
+
+  it.each([
+    "none",
+    "holder-disables",
+    "other-sender-steer",
+    "other-sender-queued-followup",
+  ] as const)(
+    "8: resolves requester grants only at the deferred launch (during the wait: %s)",
+    async (revocation) => {
+      const grants = await import("./requester-grants.js");
+      const value = `vt-${crypto.randomUUID()}`;
+      const sessionKey = "agent:main:approval-grant";
+      const target = { agentId: "main", sessionKey };
+      grants.resetRequesterGrantsForTest();
+      grants.setRequesterGrantValueProviderForTest({
+        readEntries: () => ({ VAULT_TEST_TOKEN: value }),
+      });
+      grants.enableRequesterGrantForTest({
+        holderProfileId: "alice",
+        target,
+        mode: "full-session",
+      });
+      const operatorAuthority = (profileId: string) =>
+        createAdmittedRunOperatorAuthority({ profileId, scopes: [], assertCurrent: () => {} });
+      const approval = createDeferredCore<ExecApprovalDecision>();
+      approvalDecisionMock.mockReturnValue(approval.promise);
+      const runtime = await vi.importActual<typeof import("./bash-tools.exec-runtime.js")>(
+        "./bash-tools.exec-runtime.js",
+      );
+      runExecProcessMock.mockImplementation(runtime.runExecProcess);
+      const spawned: Array<Record<string, string>> = [];
+      startupCancellationMocks.spawn.mockImplementation(async (input) => {
+        input.assertCurrent?.();
+        spawned.push({ ...(input.env as Record<string, string>) });
+        return {
+          activity: { resultSettled: true, lastOutputAtMs: Date.now() },
+          runId: "grant-run",
+          startedAtMs: Date.now(),
+          stdin: undefined,
+          cancel: vi.fn(),
+          wait: async () => ({
+            reason: "exit" as const,
+            exitCode: 0,
+            exitSignal: null,
+            durationMs: 1,
+            stdout: "",
+            stderr: "",
+            timedOut: false,
+            noOutputTimedOut: false,
+          }),
+        };
+      });
+      const warnings: string[] = [];
+      await withGatewayToolCallerIdentity(
+        {
+          agentId: "main",
+          sessionKey,
+          operatorAuthority: operatorAuthority("alice"),
+          operationalRunInstance: createOperationalRunInstanceRef("run-grant"),
+        },
+        () =>
+          runDetached({
+            env: { PATH: "/usr/bin:/bin" },
+            requestedEnv: { EXPLICIT: "1" },
+            requesterGrantReservedKeys: ["EXPLICIT"],
+            sessionKey,
+            warnings,
+          }),
+      );
+      await vi.waitFor(() => expect(approvalDecisionMock).toHaveBeenCalledOnce());
+      const mailbox = await import("../sessions/session-controller.mailbox.js");
+      const sessionTarget = (
+        await import("../sessions/session-controller.target.js")
+      ).captureSessionTarget({
+        storeScope: "/synthetic/approval-grant/sessions",
+        sessionKey,
+        agentId: "main",
+      });
+      const bobInputs: Array<ReturnType<typeof mailbox.reserveSessionControllerSource>> = [];
+      const bobCleanups: Array<() => void> = [];
+      if (revocation === "holder-disables") {
+        grants.disableRequesterGrant(target, "alice");
+      } else if (revocation === "other-sender-steer") {
+        // A dashboard chat.send steer: the real RPC source reservation.
+        const { registerChatAbortController } = await import("../gateway/chat-abort.js");
+        const registration = registerChatAbortController({
+          target: sessionTarget,
+          sessionKey,
+          sessionId: "approval-grant-session",
+          runId: `bob-steer-${crypto.randomUUID()}`,
+          timeoutMs: 60_000,
+          policy: { mode: "steer" },
+        });
+        if (!registration.registered) {
+          throw new Error("steer was not registered");
+        }
+        bobCleanups.push(registration.cleanup);
+        // retainGatewayOperatorRun records the verified sender.
+        registration.entry.adapter.requesterProfileId = "bob";
+        const injection = mailbox.beginSessionControllerSourceInjection(registration.entry.input);
+        expect(await injection.admit()).toBe(true);
+        injection.finish(true);
+      } else if (revocation === "other-sender-queued-followup") {
+        // A channel follow-up reserved by real reply ingress; its turn never starts here.
+        const { createQueueTestRun } = await import("../auto-reply/reply/queue.test-helpers.js");
+        const { bindReplySourceToFollowup, prepareReplySourceInput } =
+          await import("../auto-reply/reply/reply-source-binding.js");
+        const bobAuthority = operatorAuthority("bob");
+        const prepared = await prepareReplySourceInput(
+          { SessionKey: sessionKey },
+          { session: { store: "/synthetic/approval-grant/sessions" } },
+          { operatorAuthority: bobAuthority },
+        );
+        bobInputs.push(prepared.input!);
+        bindReplySourceToFollowup(
+          prepared.options,
+          createQueueTestRun({ prompt: "later", operatorAuthority: bobAuthority }),
+        );
+      }
+      approval.resolve("allow-once");
+      await vi.waitFor(() => expect(spawned).toHaveLength(1));
+      await waitForFollowup();
+
+      const delivered = revocation === "none" || revocation === "other-sender-queued-followup";
+      expect(spawned[0]?.VAULT_TEST_TOKEN).toBe(delivered ? value : undefined);
+      for (const input of bobInputs) {
+        mailbox.retireSessionControllerInput(input);
+      }
+      for (const cleanup of bobCleanups) {
+        cleanup();
+      }
+      for (const [name, surface] of Object.entries({
+        approvalRequests: gatewayMock.mock.calls,
+        warnings,
+        followup: followupMock.mock.calls,
+        runExecProcessEnv: runExecProcessMock.mock.calls.map(
+          ([params]) => (params as { env?: unknown }).env,
+        ),
+      })) {
+        expect(JSON.stringify(surface), name).not.toContain(value);
+      }
+      grants.setRequesterGrantValueProviderForTest(undefined);
+    },
+  );
 
   it.each([false, true])(
     "binds a full-policy timeout to the allowlist plan (headless=%s)",

@@ -9,7 +9,18 @@ import {
 import { prepareAgentRunTerminalReply } from "../agents/agent-run-terminal-reply.js";
 import type { AgentCommandGatewayIngressOpts as IngressCommand } from "../agents/command/types.js";
 import * as preparedRuntime from "../agents/prepared-model-runtime.js";
+import {
+  enableRequesterGrantForTest,
+  readRequesterGrantHoldersForTest,
+  resetRequesterGrantsForTest,
+} from "../agents/requester-grants.js";
+import { captureRequesterOrigin } from "../agents/requester-origin.js";
 import { createAgentRunDirectAbortError } from "../agents/run-termination.js";
+import {
+  getGatewayToolCallerIdentity,
+  withGatewayToolCallerIdentity,
+  withoutGatewayToolCallerIdentity,
+} from "../agents/tools/gateway-caller-context.js";
 import * as replyDelivery from "../agents/tools/sessions-send-tool.a2a.js";
 import { createSessionsSendTool } from "../agents/tools/sessions-send-tool.js";
 import { withPersonalToolTurn } from "../auto-reply/reply/personal-tool-turn.test-support.js";
@@ -62,7 +73,7 @@ installGatewayTestHooks({
 
 async function withFollowup(
   run: (fixture: {
-    send: (sessionKey?: string) => Promise<unknown>;
+    send: (sessionKey?: string, extra?: Record<string, unknown>) => Promise<unknown>;
     revoke: () => void;
     profileId: string;
     child: string;
@@ -169,9 +180,10 @@ async function withFollowup(
               idempotencyKey: runId,
             });
             return await run({
-              send: (sessionKey = sameSession ? parent : child) =>
+              send: (sessionKey, extra) =>
                 tool.execute("followup-child", {
-                  sessionKey,
+                  ...extra,
+                  sessionKey: sessionKey ?? (sameSession ? parent : child),
                   mode: "followup",
                   message: MESSAGE,
                   timeoutSeconds: 0,
@@ -429,6 +441,130 @@ it("rejects preparation-time revocation without input effects", async ({ signal 
       await settled;
       held.mockRestore();
       stage.mockRestore();
+    }
+  });
+});
+
+it.for(["holder", "other operator", "no operator"] as const)(
+  "a queued sessions_send from the %s ends the target's grant at its turn unless it holds it",
+  async (sender, { signal }) => {
+    await withFollowup(async ({ send, profileId, child, parent, runId, waitForCompletion }) => {
+      agentCommandMock.mockImplementation(async (input) => {
+        await expectDefined(
+          (input as IngressCommand).userTurnTranscriptRecorder,
+          "real input recorder",
+        ).persistApproved();
+        return { payloads: [], meta: { durationMs: 1 } };
+      });
+      // The sending turn's admitted operator is profileId.
+      const grantTarget = { agentId: "main", sessionKey: child };
+      resetRequesterGrantsForTest();
+      const holder = sender === "other operator" ? "grant-holder" : profileId;
+      enableRequesterGrantForTest({
+        holderProfileId: holder,
+        target: grantTarget,
+        mode: "full-session",
+      });
+      try {
+        const requesterOrigin = getGatewayToolCallerIdentity()?.requesterOrigin;
+        const sent =
+          sender === "no operator"
+            ? withoutGatewayToolCallerIdentity(() =>
+                withGatewayToolCallerIdentity(
+                  { agentId: "main", sessionKey: parent, requesterOrigin },
+                  () => send(),
+                ),
+              )
+            : send();
+        await expect(sent).resolves.toMatchObject({ details: { status: "accepted", runId } });
+        await waitForCompletion(signal);
+        expect(readRequesterGrantHoldersForTest(grantTarget)).toEqual(
+          sender === "holder" ? [holder] : [],
+        );
+      } finally {
+        resetRequesterGrantsForTest();
+      }
+    });
+  },
+);
+
+it("a queued sessions_send that selects the holder as participant still ends the grant: the sender is the run operator", async ({
+  signal,
+}) => {
+  await withFollowup(async ({ send, parent, runId, waitForCompletion }) => {
+    agentCommandMock.mockImplementation(async (input) => {
+      await expectDefined(
+        (input as IngressCommand).userTurnTranscriptRecorder,
+        "real input recorder",
+      ).persistApproved();
+      return { payloads: [], meta: { durationMs: 1 } };
+    });
+    // Bob runs the sending turn; the model selects Alice, who holds the grant, as `user`.
+    const context = kernel.gatewayRequestContext;
+    const aliceClient = roleClient("view", `followup-alice-${runId}`);
+    aliceClient.connect.scopes = [
+      ...expectDefined(context.getRuntimeConfig().gateway?.roles?.definitions?.view, "guest role")
+        .scopes,
+    ];
+    const alice = expectDefined(
+      await captureGatewayOperatorRunAuthority({
+        client: aliceClient,
+        context,
+        sourceAuthority: { signal, assertCurrent: () => signal.throwIfAborted() },
+      }),
+      "selected participant authority",
+    );
+    // Alice joined the turn earlier (as a steer would), so the turn's registry admits her.
+    const participants = expectDefined(
+      getGatewayToolCallerIdentity()?.personalToolParticipants,
+      "turn participants",
+    );
+    participants.accept({
+      operatorAuthority: alice.authority,
+      requesterOrigin: captureRequesterOrigin({
+        sessionKey: parent,
+        operatorProfileId: alice.authority.profileId,
+      }),
+    });
+    // Narrow writes are admitted for the selected participant, so the target is Alice's child session.
+    const target = `agent:main:dashboard:followup-alice-${runId}`;
+    await upsertSessionEntryCore(
+      { agentId: "main", sessionKey: target },
+      {
+        sessionId: target,
+        lifecycleRevision: "retained-generation",
+        updatedAt: 1,
+        visibility: "shared",
+        status: "done",
+        createdVia: "operator",
+        createdActor: { type: "human", source: "profile", id: alice.authority.profileId },
+        sandbox: "required",
+        spawnedBy: parent,
+        parentSessionId: parent,
+      },
+    );
+    const grantTarget = { agentId: "main", sessionKey: target };
+    resetRequesterGrantsForTest();
+    enableRequesterGrantForTest({
+      holderProfileId: alice.authority.profileId,
+      target: grantTarget,
+      mode: "full-session",
+    });
+    try {
+      await expect(send(target, { user: alice.authority.profileId })).resolves.toMatchObject({
+        details: { status: "accepted", runId },
+      });
+      await waitForCompletion(signal);
+      // The selection is honored for admission; only the grant's sender stays the run operator.
+      const command = expectDefined(
+        agentCommandMock.mock.calls.at(-1)?.[0] as IngressCommand | undefined,
+        "delivered input",
+      );
+      expect(command.operatorAuthority?.profileId).toBe(alice.authority.profileId);
+      expect(readRequesterGrantHoldersForTest(grantTarget)).toEqual([]);
+    } finally {
+      resetRequesterGrantsForTest();
+      alice.release();
     }
   });
 });

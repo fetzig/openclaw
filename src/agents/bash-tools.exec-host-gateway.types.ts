@@ -12,6 +12,8 @@ import type { AgentToolResult } from "./runtime/index.js";
 export type ProcessGatewayAllowlistParams = ExecHostCommandParams & {
   workdir: string;
   secretEgressBindings?: readonly SecretEgressSentinelBinding[];
+  /** Names only; carried to the deferred launch after an approval wait. */
+  requesterGrantReservedKeys?: readonly string[];
   durable?: DurableExecOptions;
   githubProfileDir?: string;
   pathPrepend?: string[];

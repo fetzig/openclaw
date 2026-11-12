@@ -422,19 +422,20 @@ export function createExecTool(defaults?: ExecToolDefaults) {
         if (useSecretEgress && !defaults?.operationalRunInstance) {
           throw new Error("Secret egress proxy requires an admitted agent run instance");
         }
-        const { env, requestedEnv, executionContext } = resolvePreparedExecEnvironment({
-          execParams: params,
-          host,
-          sandbox,
-          channelContext: defaults?.channelContext,
-          subagentExecution,
-          defaultPathPrepend,
-          pluginEnv: resolvedExecEnvState?.pluginEnv,
-          storeEnv: host === "gateway" ? storeEnv.env : undefined,
-          storeSecretEnv: useSecretEgress ? storeEnv.secretSentinels : undefined,
-          ...preparedRunEnvironment,
-          warnings,
-        });
+        const { env, requestedEnv, reservedKeys, executionContext } =
+          resolvePreparedExecEnvironment({
+            execParams: params,
+            host,
+            sandbox,
+            channelContext: defaults?.channelContext,
+            subagentExecution,
+            defaultPathPrepend,
+            pluginEnv: resolvedExecEnvState?.pluginEnv,
+            storeEnv: host === "gateway" ? storeEnv.env : undefined,
+            storeSecretEnv: useSecretEgress ? storeEnv.secretSentinels : undefined,
+            ...preparedRunEnvironment,
+            warnings,
+          });
 
         const hostApprovalParams = () => ({
           approvalTransport,
@@ -499,6 +500,7 @@ export function createExecTool(defaults?: ExecToolDefaults) {
             ...hostApprovalParams(),
             workdir,
             secretEgressBindings,
+            requesterGrantReservedKeys: reservedKeys,
             durable: params.durable ? durableNotifications : undefined,
             githubProfileDir,
             pathPrepend: defaultPathPrepend,
@@ -556,6 +558,7 @@ export function createExecTool(defaults?: ExecToolDefaults) {
           workdir,
           env,
           secretEgressBindings,
+          requesterGrantReservedKeys: reservedKeys,
           durable: params.durable ? durableNotifications : undefined,
           sessionId: defaults?.sessionId,
           githubProfileDir,

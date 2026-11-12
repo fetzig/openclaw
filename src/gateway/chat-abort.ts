@@ -204,6 +204,8 @@ export function registerChatAbortController(params: {
     projectSessionActive: params.projectSessionActive,
     kind: params.kind,
     turnKind: params.turnKind,
+    // An RPC client's input; operator admission clears this for the host's own system turn.
+    humanIngress: true,
   };
   const target =
     params.target.agentId || !params.agentId

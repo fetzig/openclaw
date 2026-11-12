@@ -434,7 +434,11 @@ export function submitSessionControllerInput(
   key: string,
   source: FollowupRun,
   policy: QueueSettings,
-  options?: { protocolRunId?: string; storePath?: string },
+  options?: {
+    protocolRunId?: string;
+    storePath?: string;
+    adapter?: SessionControllerSourceAdapter;
+  },
 ): SessionControllerInput {
   if (source.controllerInput) {
     if (!source.controllerInput.mailbox.owner.aliases.has(key.trim())) {
@@ -450,6 +454,7 @@ export function submitSessionControllerInput(
     protocolRunId: options?.protocolRunId,
     policy,
     target: resolveSourceTarget(key, source, options?.storePath),
+    adapter: options?.adapter,
   });
   bindSessionControllerSource(input, source);
   return input;
