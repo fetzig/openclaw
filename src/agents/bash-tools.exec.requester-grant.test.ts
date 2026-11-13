@@ -105,6 +105,7 @@ let toToolDefinitions: typeof import("./agent-tool-definition-adapter.js").toToo
 const AGENT = "main";
 const SESSION = "agent:main:dashboard:vault";
 const STORE = "/synthetic/requester-grant/sessions";
+const OTHER_STORE = "/synthetic/requester-grant/other-sessions";
 const KEY = "VAULT_TEST_TOKEN";
 let value: string;
 let logs: string[];
@@ -120,7 +121,7 @@ const target = (overrides: { agentId?: string; storeScope?: string } = {}) =>
 const grant = (holder: string, mode: RequesterGrantMode = "full-session", extra = {}) =>
   enableRequesterGrantForTest({
     holderProfileId: holder,
-    target: { agentId: AGENT, sessionKey: SESSION },
+    target: { storeScope: STORE, agentId: AGENT, sessionKey: SESSION },
     mode,
     ...extra,
   });
@@ -147,6 +148,7 @@ async function launch(
       warnings,
       sessionKey: SESSION,
       agentId: caller.agentId,
+      requesterGrant: { storeScope: STORE },
       approvalTransport: {
         assertExecution: (request: unknown) => transportEnvs.push(request),
       } as never,
@@ -179,7 +181,31 @@ const inputs: SessionControllerInput[] = [];
 const claims: SessionControllerMailboxClaim[] = [];
 const injections: ReturnType<typeof beginSessionControllerSourceInjection>[] = [];
 const registrations: Array<{ cleanup(): void }> = [];
-const holders = () => readRequesterGrantHoldersForTest({ agentId: AGENT, sessionKey: SESSION });
+const holders = (storeScope = STORE) =>
+  readRequesterGrantHoldersForTest({ storeScope, agentId: AGENT, sessionKey: SESSION });
+
+/** Runs the exec tool inside a session turn of the given store, as an agent turn does. */
+async function execToolInTurn(
+  caller: ReturnType<typeof turn>,
+  params: Record<string, unknown>,
+  storeScope = STORE,
+) {
+  const tool = createExecTool({ host: "gateway", security: "full", ask: "off" });
+  const [definition] = toToolDefinitions([tool], { agentId: AGENT, sessionKey: SESSION });
+  return await withSessionTurn(
+    { sessionKey: SESSION, sessionId: "vault-session", agentId: AGENT, storePath: storeScope },
+    () =>
+      withGatewayToolCallerIdentity(caller, () =>
+        definition!.execute(
+          `call-${randomUUID()}`,
+          { yieldMs: 120_000, ...params },
+          undefined,
+          undefined,
+          {} as ExtensionContext,
+        ),
+      ),
+  );
+}
 
 /** A channel prompt or follow-up from one sender: reserved by real reply ingress, then bound (not claimed). */
 async function queue(profileId: string | undefined, sessionTarget?: SessionTarget) {
@@ -305,17 +331,7 @@ describe("requester-bound exec grants", () => {
       runBeforeToolCall: vi.fn(async () => undefined),
     };
     mocks.hookRunner = hooks;
-    const tool = createExecTool({ host: "gateway", security: "full", ask: "off" });
-    const [definition] = toToolDefinitions([tool], { agentId: AGENT, sessionKey: SESSION });
-    const result = await withGatewayToolCallerIdentity(turn("alice"), () =>
-      definition!.execute(
-        "call-1",
-        { command: "echo ok", yieldMs: 120_000 },
-        undefined,
-        undefined,
-        {} as ExtensionContext,
-      ),
-    );
+    const result = await execToolInTurn(turn("alice"), { command: "echo ok" });
 
     expect(mocks.spawnInputs.at(-1)?.env?.[KEY]).toBe(value);
     expect(isSecretValueRegisteredForRedaction(value)).toBe(true);
@@ -342,17 +358,10 @@ describe("requester-bound exec grants", () => {
       runResolveExecEnv: vi.fn(async () => ({ PLUGIN_KEY: "from-plugin" })),
       runBeforeToolCall: vi.fn(),
     };
-    const tool = createExecTool({ host: "gateway", security: "full", ask: "off" });
-    const [definition] = toToolDefinitions([tool], { agentId: AGENT, sessionKey: SESSION });
-    const result = await withGatewayToolCallerIdentity(turn("alice"), () =>
-      definition!.execute(
-        "call-16",
-        { command: "echo ok", yieldMs: 120_000, env: { [KEY]: "per-call" } },
-        undefined,
-        undefined,
-        {} as ExtensionContext,
-      ),
-    );
+    const result = await execToolInTurn(turn("alice"), {
+      command: "echo ok",
+      env: { [KEY]: "per-call" },
+    });
 
     expect(mocks.spawnInputs.at(-1)?.env).toMatchObject({
       [KEY]: "per-call",
@@ -486,11 +495,16 @@ describe("requester-bound exec grants", () => {
   it("9: a revocation between lookup and spawn fails the launch closed", async () => {
     grant("alice");
     mocks.beforeNativeSpawn = () =>
-      disableRequesterGrant({ agentId: AGENT, sessionKey: SESSION }, "alice");
+      disableRequesterGrant({ storeScope: STORE, agentId: AGENT, sessionKey: SESSION }, "alice");
     const warnings: string[] = [];
     await expect(
       withGatewayToolCallerIdentity(turn("alice"), () =>
-        runExecFixture({ warnings, sessionKey: SESSION, agentId: AGENT }),
+        runExecFixture({
+          warnings,
+          sessionKey: SESSION,
+          agentId: AGENT,
+          requesterGrant: { storeScope: STORE },
+        }),
       ),
     ).rejects.toThrow("Session secrets were revoked before the command started");
     expect(mocks.spawnInputs).toHaveLength(0);
@@ -567,6 +581,25 @@ describe("requester-bound exec grants", () => {
     expect(sameAgent.env[KEY]).toBe(value);
     expect(otherAgent.env[KEY]).toBeUndefined();
     expectNoLeak({ ...sameAgent.surfaces, other: otherAgent.surfaces });
+  });
+
+  it("22: the same agent and key in another session store share no grant", async () => {
+    grant("alice");
+    grant("alice", "full-session", {
+      target: { storeScope: OTHER_STORE, agentId: AGENT, sessionKey: SESSION },
+    });
+    // Bob's prompt in the other store's session ends only that store's grant.
+    await endTurn(await startTurn(await queue("bob", target({ storeScope: OTHER_STORE }))));
+    expect(holders()).toEqual(["alice"]);
+    expect(holders(OTHER_STORE)).toEqual([]);
+
+    // The exec tool keys the lookup by the store of the turn it runs in.
+    const otherStore = await execToolInTurn(turn("alice"), { command: "echo ok" }, OTHER_STORE);
+    const ownStore = await execToolInTurn(turn("alice"), { command: "echo ok" });
+    expect(mocks.spawnInputs).toHaveLength(2);
+    expect(mocks.spawnInputs[0]?.env?.[KEY]).toBeUndefined();
+    expect(mocks.spawnInputs[1]?.env?.[KEY]).toBe(value);
+    expectNoLeak({ otherStore, ownStore, logs });
   });
 
   it("17: entryNames delivers only the selected entries", async () => {

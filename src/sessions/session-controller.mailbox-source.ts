@@ -56,6 +56,7 @@ export function tripRequesterGrantBreaker(input: SessionControllerInput): void {
   const target = input.target ?? input.mailbox.owner.target;
   revokeOtherRequesterGrants(
     {
+      storeScope: target?.storeScope,
       agentId: target?.agentId ?? input.source?.run.agentId,
       sessionKey: target?.sessionKey ?? input.mailbox.key,
     },

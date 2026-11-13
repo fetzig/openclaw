@@ -69,7 +69,7 @@ import type { DurableExecOptions } from "./bash-tools.exec-types.js";
 import type { BashSandboxConfig } from "./bash-tools.shared.js";
 import { chunkString, clampWithDefault, readEnvInt } from "./bash-tools.shared.js";
 import type { ExecApprovalTransport } from "./exec-approval-transport.js";
-import { resolveRequesterGrantLaunch } from "./requester-grants.js";
+import { resolveRequesterGrantLaunch, type RequesterGrantLaunch } from "./requester-grants.js";
 import { recordAgentCleanupFailure } from "./run-cleanup-timeout.js";
 import type { AgentToolResult } from "./runtime/index.js";
 import { createStreamingBinaryOutputSanitizer } from "./shell-utils.js";
@@ -218,7 +218,7 @@ export async function runExecProcess({
   workdir: string;
   env: Record<string, string>;
   secretEgressBindings?: readonly SecretEgressSentinelBinding[];
-  requesterGrantReservedKeys?: readonly string[];
+  requesterGrant?: RequesterGrantLaunch;
   /** Host-selected managed profile; never inferred from the requested environment. */
   githubProfileDir?: string;
   pathPrepend?: string[];

@@ -27,6 +27,7 @@ import {
 import { createUsageFixture } from "../../agents/test-helpers/usage-fixtures.js";
 import type { NormalizedUsage } from "../../agents/usage.js";
 import { setRuntimeConfigSnapshot, type OpenClawConfig } from "../../config/config.js";
+import { resolveSessionStorePathCore } from "../../config/sessions/paths.js";
 import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import { SESSION_TOTAL_TOKENS_VERSION } from "../../config/sessions/types.js";
 import { settlePendingFinalDelivery } from "../../infra/outbound/delivery-completion.js";
@@ -1243,7 +1244,12 @@ describe("runReplyAgent requester-grant breaker", () => {
   it("counts a reply turn without a prepared reply source as human input", async () => {
     // A channel context without SessionKey reserves nothing at prepareReplySourceInput;
     // runReplyAgent reserves the turn itself, and that reservation is still a person's message.
-    const target = { agentId: "main", sessionKey: "agent:main:grant-unprepared" };
+    const target = {
+      // createBaseRun configures no store, so the reply turn uses the agent's default store.
+      storeScope: resolveSessionStorePathCore(undefined, { agentId: "main" }),
+      agentId: "main",
+      sessionKey: "agent:main:grant-unprepared",
+    };
     resetRequesterGrantsForTest();
     enableRequesterGrantForTest({ holderProfileId: "alice", target, mode: "full-session" });
     try {

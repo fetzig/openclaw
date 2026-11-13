@@ -14,6 +14,11 @@ import {
 } from "../infra/host-env-security.js";
 import { registerSecretValueForRedaction } from "../logging/secret-redaction-registry.js";
 import { normalizeAgentId } from "../routing/session-key.js";
+import { getCurrentSessionControllerOwner } from "../sessions/session-controller.context.js";
+import {
+  getSessionControllerEntryForOperation,
+  isCurrentSessionControllerOperation,
+} from "../sessions/session-controller.identity.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import type { AdmittedRunOperatorAuthority } from "./admitted-run-operator-authority.types.js";
 import {
@@ -23,18 +28,34 @@ import {
 } from "./operational-run-instance.js";
 
 export type RequesterGrantMode = "single-turn" | "full-session";
-export type RequesterGrantTarget = Readonly<{ agentId?: string; sessionKey: string }>;
+/**
+ * One physical session: the session store it lives in, its agent and its key. The same
+ * agent and key in two session stores are two sessions and never share a grant.
+ */
+export type RequesterGrantTarget = Readonly<{
+  storeScope: string;
+  agentId?: string;
+  sessionKey: string;
+}>;
 
 type RequesterGrant = {
   readonly holderProfileId: string;
-  readonly agentId: string;
-  readonly sessionKey: string;
+  /** targetKey() of the session the grant belongs to. */
+  readonly key: string;
   readonly mode: RequesterGrantMode;
   readonly entryNames?: readonly string[];
   readonly createdSeq: number;
   readonly expiresAt: number;
   pinnedRunInstanceId?: string;
 };
+
+/** Captured when the exec tool runs and carried to the launch, also after an approval wait. */
+export type RequesterGrantLaunch = Readonly<{
+  /** Session store of the turn that ran the tool; absent outside a session turn. */
+  storeScope?: string;
+  /** Names owned by OpenClaw or set explicitly for this call; values never travel. */
+  reservedKeys?: readonly string[];
+}>;
 
 /** Where values come from: core vault storage or a plugin later; synthetic in the spike. */
 export type RequesterGrantValueProvider = {
@@ -49,30 +70,28 @@ const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const OPENCLAW_OWNED_NAMES = new Set(["GH_TOKEN", "GITHUB_TOKEN", "PATH", "HOME"]);
 
 const state = resolveGlobalSingleton(Symbol.for("openclaw.requesterGrants"), () => ({
-  // agentId \0 sessionKey -> holderProfileId -> grant
+  // storeScope \0 agentId \0 sessionKey -> holderProfileId -> grant
   grants: new Map<string, Map<string, RequesterGrant>>(),
   provider: undefined as RequesterGrantValueProvider | undefined,
   runEndObserver: undefined as (() => void) | undefined,
 }));
 
-const keyOf = (agentId: string, sessionKey: string) => `${agentId}\0${sessionKey}`;
-const targetKey = (target: RequesterGrantTarget) => {
-  const sessionKey = target.sessionKey.trim();
-  return keyOf(normalizeAgentId(target.agentId ?? sessionKey.split(":")[1]), sessionKey);
-};
+const agentOf = (target: Omit<RequesterGrantTarget, "storeScope">) =>
+  normalizeAgentId(target.agentId ?? target.sessionKey.trim().split(":")[1]);
+const targetKey = (target: RequesterGrantTarget) =>
+  `${target.storeScope.trim()}\0${agentOf(target)}\0${target.sessionKey.trim()}`;
 
 function isLive(grant: RequesterGrant): boolean {
-  const current = state.grants.get(keyOf(grant.agentId, grant.sessionKey));
+  const current = state.grants.get(grant.key);
   return current?.get(grant.holderProfileId) === grant && Date.now() < grant.expiresAt;
 }
 
 function removeGrant(grant: RequesterGrant): void {
-  const key = keyOf(grant.agentId, grant.sessionKey);
-  const holders = state.grants.get(key);
+  const holders = state.grants.get(grant.key);
   if (holders?.get(grant.holderProfileId) === grant) {
     holders.delete(grant.holderProfileId);
     if (holders.size === 0) {
-      state.grants.delete(key);
+      state.grants.delete(grant.key);
     }
   }
 }
@@ -107,13 +126,11 @@ export function enableRequesterGrantForTest(params: {
   ttlMs?: number;
 }): void {
   const key = targetKey(params.target);
-  const [agentId, sessionKey] = key.split("\0") as [string, string];
   const holders = state.grants.get(key) ?? new Map<string, RequesterGrant>();
   state.grants.set(key, holders);
   holders.set(params.holderProfileId, {
     holderProfileId: params.holderProfileId,
-    agentId,
-    sessionKey,
+    key,
     mode: params.mode,
     ...(params.entryNames ? { entryNames: Object.freeze([...params.entryNames]) } : {}),
     // Every run created after this point has a higher sequence number.
@@ -129,15 +146,24 @@ export function disableRequesterGrant(target: RequesterGrantTarget, holderProfil
   }
 }
 
-/** Breaker: another sender (or an unverified one) entering the session ends other holders' grants. */
+/**
+ * Breaker: another sender (or an unverified one) entering the session ends other holders' grants.
+ * An input without a known session store ends them in every store with that agent and key.
+ */
 export function revokeOtherRequesterGrants(
-  target: RequesterGrantTarget,
+  target: Omit<RequesterGrantTarget, "storeScope"> & { storeScope?: string },
   senderProfileId: string | undefined,
 ): void {
-  const holders = state.grants.get(targetKey(target));
-  for (const grant of holders?.values() ?? []) {
-    if (grant.holderProfileId !== senderProfileId) {
-      removeGrant(grant);
+  const { storeScope } = target;
+  const suffix = `\0${agentOf(target)}\0${target.sessionKey.trim()}`;
+  for (const [key, holders] of state.grants) {
+    if (storeScope ? key !== targetKey({ ...target, storeScope }) : !key.endsWith(suffix)) {
+      continue;
+    }
+    for (const grant of holders.values()) {
+      if (grant.holderProfileId !== senderProfileId) {
+        removeGrant(grant);
+      }
     }
   }
 }
@@ -181,6 +207,21 @@ function rejectionReason(name: string, value: string): string | undefined {
 }
 
 /**
+ * Captures the physical session the current turn runs in. Its store comes from the same
+ * session controller entry whose inputs trip the breaker, so lookup and revocation agree.
+ */
+export function captureRequesterGrantLaunch(reservedKeys: readonly string[]): RequesterGrantLaunch {
+  const owner = getCurrentSessionControllerOwner();
+  return {
+    reservedKeys,
+    storeScope:
+      owner && isCurrentSessionControllerOperation(owner)
+        ? getSessionControllerEntryForOperation(owner).target?.storeScope
+        : undefined,
+  };
+}
+
+/**
  * Launch-time lookup, called inside runExecProcess immediately before spawn.
  * Returns the env to merge and a synchronous re-check for the final spawn boundary.
  */
@@ -197,18 +238,18 @@ export async function resolveRequesterGrantLaunch(
     /** Sandbox and durable launches never receive values. */
     sandbox?: unknown;
     durable?: unknown;
-    /** Names owned by OpenClaw or set explicitly for this call; values never travel. */
-    requesterGrantReservedKeys?: readonly string[];
+    requesterGrant?: RequesterGrantLaunch;
     warnings: string[];
   }>,
 ): Promise<{ env: Record<string, string>; assertCurrent: () => void } | undefined> {
   const profileId = caller?.operatorAuthority?.profileId;
   const run = caller?.operationalRunInstance;
-  if (!caller?.sessionKey || !profileId) {
+  const storeScope = launch.requesterGrant?.storeScope;
+  if (!caller?.sessionKey || !profileId || !storeScope) {
     return undefined;
   }
   const grant = state.grants
-    .get(targetKey({ agentId: caller.agentId, sessionKey: caller.sessionKey }))
+    .get(targetKey({ storeScope, agentId: caller.agentId, sessionKey: caller.sessionKey }))
     ?.get(profileId);
   if (!grant) {
     return undefined;
@@ -244,7 +285,7 @@ export async function resolveRequesterGrantLaunch(
   if (!isLive(grant)) {
     return undefined;
   }
-  const reserved = new Set(launch.requesterGrantReservedKeys?.map((key) => key.toUpperCase()));
+  const reserved = new Set(launch.requesterGrant?.reservedKeys?.map((key) => key.toUpperCase()));
   const env: Record<string, string> = {};
   const rejected: string[] = [];
   let count = 0;

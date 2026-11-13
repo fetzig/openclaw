@@ -1423,7 +1423,8 @@ describe("processGatewayAllowlist", () => {
       const grants = await import("./requester-grants.js");
       const value = `vt-${crypto.randomUUID()}`;
       const sessionKey = "agent:main:approval-grant";
-      const target = { agentId: "main", sessionKey };
+      const storeScope = "/synthetic/approval-grant/sessions";
+      const target = { storeScope, agentId: "main", sessionKey };
       grants.resetRequesterGrantsForTest();
       grants.setRequesterGrantValueProviderForTest({
         readEntries: () => ({ VAULT_TEST_TOKEN: value }),
@@ -1475,7 +1476,7 @@ describe("processGatewayAllowlist", () => {
           runDetached({
             env: { PATH: "/usr/bin:/bin" },
             requestedEnv: { EXPLICIT: "1" },
-            requesterGrantReservedKeys: ["EXPLICIT"],
+            requesterGrant: { reservedKeys: ["EXPLICIT"], storeScope },
             sessionKey,
             warnings,
           }),
@@ -1485,7 +1486,7 @@ describe("processGatewayAllowlist", () => {
       const sessionTarget = (
         await import("../sessions/session-controller.target.js")
       ).captureSessionTarget({
-        storeScope: "/synthetic/approval-grant/sessions",
+        storeScope,
         sessionKey,
         agentId: "main",
       });
@@ -1521,7 +1522,7 @@ describe("processGatewayAllowlist", () => {
         const bobAuthority = operatorAuthority("bob");
         const prepared = await prepareReplySourceInput(
           { SessionKey: sessionKey },
-          { session: { store: "/synthetic/approval-grant/sessions" } },
+          { session: { store: storeScope } },
           { operatorAuthority: bobAuthority },
         );
         bobInputs.push(prepared.input!);

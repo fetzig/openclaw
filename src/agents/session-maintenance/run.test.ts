@@ -200,7 +200,11 @@ it("admits maintenance on its Gateway successor after the foreground plugin scop
 it("leaves a full-session exec grant intact: maintenance is a host task, not human input", () =>
   withOpenClawTestState({ label: "maintenance-requester-grant" }, async ({ env }) => {
     const { scope, schedule } = await setup(env, "maintenance-requester-grant");
-    const grantTarget = { agentId: scope.agentId, sessionKey: scope.sessionKey };
+    const grantTarget = {
+      storeScope: scope.storePath,
+      agentId: scope.agentId,
+      sessionKey: scope.sessionKey,
+    };
     const holders = () => readRequesterGrantHoldersForTest(grantTarget);
     resetRequesterGrantsForTest();
     enableRequesterGrantForTest({

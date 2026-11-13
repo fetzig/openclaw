@@ -419,7 +419,11 @@ describe("sessions_send steer: requester-grant sender", () => {
     async (sender) => {
       await withParticipantSessionToolsFixture(async ({ cfg, alice }) => {
         // The sending turn's admitted operator is Alice.
-        const grantTarget = { agentId: "main", sessionKey: PARTICIPANT_SHARED };
+        const grantTarget = {
+          storeScope: sessionToolsStorePath(cfg),
+          agentId: "main",
+          sessionKey: PARTICIPANT_SHARED,
+        };
         resetRequesterGrantsForTest();
         const holder = sender === "other operator" ? "grant-holder" : alice.profileId;
         enableRequesterGrantForTest({

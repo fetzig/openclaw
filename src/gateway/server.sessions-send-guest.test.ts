@@ -457,7 +457,11 @@ it.for(["holder", "other operator", "no operator"] as const)(
         return { payloads: [], meta: { durationMs: 1 } };
       });
       // The sending turn's admitted operator is profileId.
-      const grantTarget = { agentId: "main", sessionKey: child };
+      const grantTarget = {
+        storeScope: (await loadSessionEntryAsync(child, { agentId: "main" })).storePath,
+        agentId: "main",
+        sessionKey: child,
+      };
       resetRequesterGrantsForTest();
       const holder = sender === "other operator" ? "grant-holder" : profileId;
       enableRequesterGrantForTest({
@@ -543,7 +547,11 @@ it("a queued sessions_send that selects the holder as participant still ends the
         parentSessionId: parent,
       },
     );
-    const grantTarget = { agentId: "main", sessionKey: target };
+    const grantTarget = {
+      storeScope: (await loadSessionEntryAsync(target, { agentId: "main" })).storePath,
+      agentId: "main",
+      sessionKey: target,
+    };
     resetRequesterGrantsForTest();
     enableRequesterGrantForTest({
       holderProfileId: alice.authority.profileId,
