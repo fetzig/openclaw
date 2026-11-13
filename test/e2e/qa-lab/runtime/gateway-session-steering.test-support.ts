@@ -589,11 +589,15 @@ function personHeaders(email: string) {
  * Shared-token Gateways have one owner identity, so these scenarios need their own.
  */
 export async function withPeopleGateway(
-  options: Pick<QueueConfig, "allowCollaborativeSteering" | "collaborativeSteeringFallback">,
+  options: Pick<QueueConfig, "allowCollaborativeSteering" | "collaborativeSteeringFallback"> & {
+    exec?: NonNullable<OpenClawConfig["tools"]>["exec"];
+  },
   run: (
     gateway: SteeringApi & {
       alice: GatewayClient;
       connectAs: (email: string) => Promise<GatewayClient>;
+      /** The isolated HOME holding the Gateway's state directory and workspace. */
+      home: string;
     },
   ) => Promise<void>,
 ): Promise<void> {
@@ -640,6 +644,9 @@ export async function withPeopleGateway(
         config.messages!.queue!.allowCollaborativeSteering = options.allowCollaborativeSteering;
         config.messages!.queue!.collaborativeSteeringFallback =
           options.collaborativeSteeringFallback;
+        if (options.exec) {
+          config.tools = { ...config.tools, exec: options.exec };
+        }
         const gatewayConfig: NonNullable<OpenClawConfig["gateway"]> = {
           trustedProxies: ["127.0.0.1"],
           auth: {
@@ -684,7 +691,7 @@ export async function withPeopleGateway(
           return client;
         };
         const api = createSteeringApi({ agentId: "main", model, log, operator: gateway.client });
-        await run({ ...api, alice: gateway.client, connectAs });
+        await run({ ...api, alice: gateway.client, connectAs, home });
         api.assertScriptConsumed();
       } finally {
         for (const client of clients) {
