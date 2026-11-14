@@ -7,6 +7,10 @@ import {
   loadSessionEntry,
   replaceSessionEntry,
 } from "../config/sessions/session-accessor.js";
+import {
+  addSessionMember,
+  removeSessionMember,
+} from "../config/sessions/session-sharing-store.native.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import { isSecretValueRegisteredForRedaction } from "../logging/secret-redaction-registry.js";
 import type { SpawnInput } from "../process/supervisor/types.js";
@@ -38,10 +42,10 @@ import { createOperationalRunInstanceRef } from "./operational-run-instance.js";
 import {
   disableSessionSecrets,
   enableSessionSecretsForTest,
-  endSessionSecretsIfSendersWiden,
   readSessionSecretsCreatorForTest,
   resetSessionSecretsForTest,
   SESSION_SECRETS_ENDED_ERROR,
+  SESSION_SECRETS_NO_PERSON_NOTICE,
   SESSION_SECRETS_OFF_NOTICE,
   setSessionSecretValueProviderForTest,
   type SessionSecretEntry,
@@ -111,10 +115,12 @@ const SESSION = "agent:main:dashboard:vault";
 const SESSION_ID = "vault-session";
 const OTHER_STORE = "/synthetic/session-secrets/other-sessions";
 const KEY = "VAULT_TEST_TOKEN";
-const ALICE = { type: "human", source: "profile", id: "alice" } as const;
+/** Verified Gateway profiles, created in beforeAll; Alice's old profile was merged into hers. */
+const people = { alice: "", aliceOld: "", bob: "", carol: "" };
+const human = (id: string) => ({ type: "human", source: "profile", id }) as const;
+let ALICE: ReturnType<typeof human>;
 let state: OpenClawTestState;
 let releaseProfileCatalog: (() => void) | undefined;
-let mergedAlice: { source: string; target: string };
 let store: string;
 let value: string;
 let logs: string[];
@@ -125,21 +131,21 @@ let proxy:
   | undefined;
 
 const target = (sessionKey = SESSION) => ({ storeScope: store, agentId: AGENT, sessionKey });
-const enable = (requesterProfileId = "alice", extra = {}) =>
-  enableSessionSecretsForTest({ requesterProfileId, target: target(), ...extra });
+const enable = (requesterProfileId = people.alice, extra = {}, sessionKey = SESSION) =>
+  enableSessionSecretsForTest({ requesterProfileId, target: target(sessionKey), ...extra });
 const entries = (...list: SessionSecretEntry[]) =>
   setSessionSecretValueProviderForTest({
-    readEntries: (profileId) => (profileId === "alice" ? list : []),
+    readEntries: (profileId) => (profileId === people.alice ? list : []),
   });
 const authority = (profileId: string) =>
   createAdmittedRunOperatorAuthority({ profileId, scopes: [], assertCurrent: () => {} });
 
 /** One admitted turn; `profileId` is whoever prompted it. */
-const turn = (profileId: string | undefined, agentId = AGENT) => ({
+const turn = (person: keyof typeof people | undefined, agentId = AGENT) => ({
   agentId,
   sessionKey: SESSION,
   operationalRunInstance: createOperationalRunInstanceRef(`run-${randomUUID()}`),
-  ...(profileId ? { operatorAuthority: authority(profileId) } : {}),
+  ...(person ? { operatorAuthority: authority(people[person]) } : {}),
 });
 
 /** A Gateway egress proxy stand-in that records each launch's bindings. */
@@ -247,13 +253,14 @@ beforeAll(async () => {
     env: { OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" },
   });
   store = resolveSessionStorePathCore(undefined, { agentId: AGENT });
-  await writeSession(SESSION, { createdActor: ALICE });
+  for (const name of Object.keys(people) as Array<keyof typeof people>) {
+    people[name] = ensureProfileForEmail(`${name}@example.test`).id;
+  }
   // Alice signed in under a second profile that an admin merged with her first one.
-  const source = ensureProfileForEmail("alice-old@example.test").id;
-  const mergeTarget = ensureProfileForEmail("alice@example.test").id;
-  mergeProfiles(source, mergeTarget);
-  mergedAlice = { source, target: mergeTarget };
-  // The Gateway prepares the profile catalog at admission; alias checks read it.
+  mergeProfiles(people.aliceOld, people.alice);
+  ALICE = human(people.alice);
+  await writeSession(SESSION, { createdActor: ALICE });
+  // The Gateway prepares the profile catalog at admission; sharing checks read it.
   releaseProfileCatalog = (await prepareUserProfileCatalog()).release;
   ({ createExecTool } = await import("./bash-tools.exec-run.js"));
   ({ toToolDefinitions } = await import("./agent-tool-definition-adapter.js"));
@@ -299,132 +306,201 @@ afterEach(async () => {
 });
 
 describe("who can turn session secrets on", () => {
-  const delegated = { type: "human", source: "profile", id: "carol" } as const;
-  it.each([
-    ["the profile creator", { createdActor: ALICE }, "alice"],
+  type Name = keyof typeof people;
+  it.each<[string, () => Partial<SessionEntry> & { assignTo?: Name }, Name | undefined]>([
+    ["the profile creator", () => ({ createdActor: ALICE }), "alice"],
     // The assignable owner never counts; the creator keeps the right.
-    ["the creator after Bob became owner", { createdActor: ALICE, owner: "bob" }, "alice"],
+    [
+      "the creator after Bob became owner",
+      () => ({ createdActor: ALICE, assignTo: "bob" }),
+      "alice",
+    ],
+    // Upstream's creator rule: a merged profile counts as the creator.
+    ["Alice's merged profile", () => ({ createdActor: human(people.aliceOld) }), "alice"],
     [
       "a channel sender",
-      { createdActor: { type: "human", source: "channel", id: "alice" } },
+      () => ({ createdActor: { type: "human", source: "channel", id: people.alice } }),
       undefined,
     ],
     [
       "an unknown human",
-      { createdActor: { type: "human", source: "unknown", id: "alice" } },
+      () => ({ createdActor: { type: "human", source: "unknown", id: people.alice } }),
       undefined,
     ],
-    ["an agent", { createdActor: { type: "agent", id: "main" } }, undefined],
-    ["an automation", { createdActor: { type: "system", id: "cron" } }, undefined],
+    ["an agent", () => ({ createdActor: { type: "agent", id: "main" } }), undefined],
+    ["an automation", () => ({ createdActor: { type: "system", id: "cron" } }), undefined],
+    // A creation an agent made for Alice is hers.
     [
       "an agent on Alice's behalf",
-      { createdActor: { type: "agent", id: "main", delegatedBy: ALICE } },
-      undefined,
+      () => ({ createdActor: { type: "agent", id: "main", delegatedBy: ALICE } }),
+      "alice",
     ],
     [
       "Carol through an agent",
-      { createdActor: { ...delegated, delegatedBy: { type: "agent", id: "main" } } },
+      () => ({
+        createdActor: { ...human(people.carol), delegatedBy: { type: "agent", id: "main" } },
+      }),
       undefined,
     ],
-    ["a child session", { createdActor: ALICE, parentSessionKey: SESSION }, undefined],
-    ["a spawned session", { createdActor: ALICE, spawnedBy: SESSION }, undefined],
-    ["no recorded creator", {}, undefined],
+    ["a child session", () => ({ createdActor: ALICE, parentSessionKey: SESSION }), "alice"],
+    ["a spawned session", () => ({ createdActor: ALICE, spawnedBy: SESSION }), "alice"],
+    ["no recorded creator", () => ({}), undefined],
     // Every token or password connection signs in as this one profile; it is not a person.
     [
       "the shared Gateway owner profile",
-      { createdActor: { type: "human", source: "profile", id: GATEWAY_OWNER_PROFILE_ID } },
+      () => ({ createdActor: human(GATEWAY_OWNER_PROFILE_ID) }),
       undefined,
     ],
-  ] as const)("%s", async (_label, fields, creator) => {
+  ])("%s", async (_label, fields, creator) => {
     const sessionKey = `agent:main:dashboard:creator-${randomUUID()}`;
-    const { owner, ...entry } = fields as Partial<SessionEntry> & { owner?: string };
+    const { assignTo, ...entry } = fields();
     await writeSession(sessionKey, entry);
-    if (owner) {
+    if (assignTo) {
       // Anyone who can see a session can reassign its owner; Bob takes it over.
-      const bob = { type: "human" as const, id: owner };
+      const bob = { type: "human" as const, id: people[assignTo] };
       const scope = { agentId: AGENT, sessionKey, storePath: store };
       assignSessionOwner(scope, { owner: bob, assignedBy: bob });
-      expect(loadSessionEntry(scope)?.owner?.actor.id).toBe(owner);
+      expect(loadSessionEntry(scope)?.owner?.actor.id).toBe(people[assignTo]);
     }
-    for (const requester of ["alice", "bob", "carol", GATEWAY_OWNER_PROFILE_ID]) {
-      const attempt = enableSessionSecretsForTest({
-        requesterProfileId: requester,
-        target: target(sessionKey),
-      });
-      if (requester === creator) {
+    if (entry.parentSessionKey) {
+      // Never inherited: the parent's secrets being on leaves the child off.
+      await enable();
+      expect(readSessionSecretsCreatorForTest(target(sessionKey))).toBeUndefined();
+    }
+    for (const requester of [people.alice, people.bob, people.carol, GATEWAY_OWNER_PROFILE_ID]) {
+      const attempt = enable(requester, {}, sessionKey);
+      if (creator && requester === people[creator]) {
         await expect(attempt).resolves.toBeUndefined();
       } else {
         await expect(attempt).rejects.toThrow("Only the session's creator");
       }
     }
-    expect(readSessionSecretsCreatorForTest(target(sessionKey))).toBe(creator);
-  });
-
-  it("a profile merged with the creator counts as the creator", async () => {
-    const sessionKey = `agent:main:dashboard:alias-${randomUUID()}`;
-    await writeSession(sessionKey, {
-      createdActor: { type: "human", source: "profile", id: mergedAlice.source },
-    });
-    await enableSessionSecretsForTest({
-      requesterProfileId: mergedAlice.target,
-      target: target(sessionKey),
-    });
-    expect(readSessionSecretsCreatorForTest(target(sessionKey))).toBe(mergedAlice.target);
+    expect(readSessionSecretsCreatorForTest(target(sessionKey))).toBe(
+      creator ? people[creator] : undefined,
+    );
   });
 
   it("refuses a session that does not exist and only the creator turns them off", async () => {
     await expect(
       enableSessionSecretsForTest({
-        requesterProfileId: "alice",
+        requesterProfileId: people.alice,
         target: target("agent:main:dashboard:missing"),
       }),
     ).rejects.toThrow("Only the session's creator");
     await enable();
-    disableSessionSecrets(target(), "bob");
-    expect(readSessionSecretsCreatorForTest(target())).toBe("alice");
-    disableSessionSecrets(target(), "alice");
+    disableSessionSecrets(target(), people.bob);
+    expect(readSessionSecretsCreatorForTest(target())).toBe(people.alice);
+    disableSessionSecrets(target(), people.alice);
     expect(readSessionSecretsCreatorForTest(target())).toBeUndefined();
   });
 });
 
-it("a visibility change ends session secrets only when more people can send", async () => {
-  // Draft: creator and admins. Read-only, Suggest: plus invited members. Shared: everyone.
-  const widening = new Set([
-    "draft>read-only",
-    "draft>suggest",
-    "draft>shared",
-    "read-only>shared",
-    "suggest>shared",
-  ]);
-  const visibilities = ["draft", "read-only", "suggest", "shared"] as const;
-  for (const previous of visibilities) {
-    for (const next of visibilities) {
-      await enable();
-      endSessionSecretsIfSendersWiden(target(), previous, next);
-      expect(readSessionSecretsCreatorForTest(target()), `${previous} -> ${next}`).toBe(
-        widening.has(`${previous}>${next}`) ? undefined : "alice",
-      );
-    }
-  }
-});
-
-it("enable, the visibility hook and the launch name one session however its key is spelled", async () => {
-  // Enabled under the agent-relative alias; launches and the hook use the canonical key.
-  await enableSessionSecretsForTest({
-    requesterProfileId: "alice",
-    target: { storeScope: store, agentId: AGENT, sessionKey: "dashboard:vault" },
-  });
-  const on = await execToolInTurn(turn("bob"), { command: "echo ok" });
-  endSessionSecretsIfSendersWiden(
-    { storeScope: store, agentId: AGENT, sessionKey: SESSION },
-    "draft",
-    "shared",
+/** A fresh session of Alice's with the given fields; returns its key. */
+async function aliceSession(fields: Partial<SessionEntry> = {}) {
+  const sessionKey = `agent:main:dashboard:reach-${randomUUID()}`;
+  await writeSession(sessionKey, { createdActor: ALICE, ...fields });
+  return sessionKey;
+}
+const launchIn = (sessionKey: string, person: keyof typeof people | undefined) =>
+  launch(turn(person), { sessionKey, sessionSecrets: { target: target(sessionKey) } });
+const setVisibility = (sessionKey: string, visibility: SessionEntry["visibility"]) =>
+  writeSession(sessionKey, { createdActor: ALICE, visibility });
+const addMember = (sessionKey: string, person: keyof typeof people) =>
+  addSessionMember(
+    { agentId: AGENT, sessionKey, storePath: store },
+    { identityId: people[person], addedBy: people.alice },
   );
-  const off = await execToolInTurn(turn("bob"), { command: "echo ok" });
 
-  expect(mocks.spawnInputs.map((input) => input.env?.[KEY])).toEqual([value, undefined]);
-  expect(JSON.stringify(off)).toContain(SESSION_SECRETS_OFF_NOTICE);
-  expectNoLeak({ on, off, logs });
+describe("who may send decides at launch", () => {
+  it("a change that lets more people send ends them at the next launch, once", async () => {
+    // Bob is an invited member: he can send in Read-only, Suggest and Shared, never in Draft.
+    const widening = new Set([
+      "draft>read-only",
+      "draft>suggest",
+      "draft>shared",
+      "read-only>shared",
+      "suggest>shared",
+    ]);
+    const visibilities = ["draft", "read-only", "suggest", "shared"] as const;
+    for (const previous of visibilities) {
+      for (const next of visibilities) {
+        const sessionKey = await aliceSession({ visibility: previous });
+        addMember(sessionKey, "bob");
+        await enable(people.alice, {}, sessionKey);
+        await setVisibility(sessionKey, next);
+        const first = await launchIn(sessionKey, "alice");
+        const ended = widening.has(`${previous}>${next}`);
+        expect(first.env[KEY], `${previous} -> ${next}`).toBe(ended ? undefined : value);
+        expect(first.warnings).toEqual(ended ? [SESSION_SECRETS_OFF_NOTICE] : []);
+        expect(readSessionSecretsCreatorForTest(target(sessionKey))).toBe(
+          ended ? undefined : people.alice,
+        );
+      }
+    }
+  });
+
+  it("adding a member to a Read-only session ends them at the next launch", async () => {
+    const sessionKey = await aliceSession({ visibility: "read-only" });
+    await enable(people.alice, {}, sessionKey);
+    const before = await launchIn(sessionKey, "alice");
+    addMember(sessionKey, "carol");
+    const after = await launchIn(sessionKey, "alice");
+    const later = await launchIn(sessionKey, "alice");
+
+    expect([before, after, later].map((result) => result.env[KEY])).toEqual([
+      value,
+      undefined,
+      undefined,
+    ]);
+    expect(after.warnings).toEqual([SESSION_SECRETS_OFF_NOTICE]);
+    expect(later.warnings).toEqual([]);
+    expectNoLeak({ before: before.surfaces, after: after.surfaces, later: later.surfaces });
+  });
+
+  it("swapping one member for another ends them, though no more people can send", async () => {
+    const sessionKey = await aliceSession({ visibility: "read-only" });
+    addMember(sessionKey, "bob");
+    await enable(people.alice, {}, sessionKey);
+    removeSessionMember({ agentId: AGENT, sessionKey, storePath: store }, people.bob);
+    addMember(sessionKey, "carol");
+    const { env, warnings, surfaces } = await launchIn(sessionKey, "alice");
+
+    expect(env[KEY]).toBeUndefined();
+    expect(warnings).toEqual([SESSION_SECRETS_OFF_NOTICE]);
+    expectNoLeak(surfaces);
+  });
+
+  it("only a run acting for a person who may send gets them", async () => {
+    const sessionKey = await aliceSession({ visibility: "draft" });
+    await enable(people.alice, {}, sessionKey);
+    const alice = await launchIn(sessionKey, "alice");
+    // Bob cannot send in Alice's Draft; a run for him gets nothing, and they stay on.
+    const bob = await launchIn(sessionKey, "bob");
+    // No person: unlinked channel senders, hooks, node requests, system dispatch.
+    const nobody = await launchIn(sessionKey, undefined);
+
+    expect(alice.env[KEY]).toBe(value);
+    for (const result of [bob, nobody]) {
+      expect(result.env[KEY]).toBeUndefined();
+      expect(result.warnings).toEqual([SESSION_SECRETS_NO_PERSON_NOTICE]);
+    }
+    expect(readSessionSecretsCreatorForTest(target(sessionKey))).toBe(people.alice);
+    expectNoLeak({ alice: alice.surfaces, bob: bob.surfaces, nobody: nobody.surfaces });
+  });
+
+  it("enable and launch name one session however its key is spelled", async () => {
+    // Enabled under the agent-relative alias; launches use the canonical key.
+    const alias = { storeScope: store, agentId: AGENT, sessionKey: "dashboard:vault" };
+    await enableSessionSecretsForTest({ requesterProfileId: people.alice, target: alias });
+    const on = await execToolInTurn(turn("bob"), { command: "echo ok" });
+    expect(readSessionSecretsCreatorForTest(target())).toBe(people.alice);
+    disableSessionSecrets(alias, people.alice);
+    const off = await execToolInTurn(turn("bob"), { command: "echo ok" });
+
+    expect(mocks.spawnInputs.map((input) => input.env?.[KEY])).toEqual([value, undefined]);
+    expect(JSON.stringify(off)).toContain(SESSION_SECRETS_OFF_NOTICE);
+    expectNoLeak({ on, off, logs });
+  });
 });
 
 describe("session secrets at launch", () => {
@@ -437,11 +513,13 @@ describe("session secrets at launch", () => {
     };
     mocks.hookRunner = hooks;
     const results = [];
-    for (const prompter of ["alice", "bob", undefined]) {
+    for (const prompter of ["alice", "bob", undefined] as const) {
       results.push(await execToolInTurn(turn(prompter), { command: "echo ok" }));
     }
 
-    expect(mocks.spawnInputs.map((input) => input.env?.[KEY])).toEqual([value, value, value]);
+    // A turn that acts for no person gets nothing.
+    expect(mocks.spawnInputs.map((input) => input.env?.[KEY])).toEqual([value, value, undefined]);
+    expect(JSON.stringify(results[2])).toContain(SESSION_SECRETS_NO_PERSON_NOTICE);
     expect(isSecretValueRegisteredForRedaction(value)).toBe(true);
     expect(hooks.runResolveExecEnv).toHaveBeenCalled();
     expect(hooks.runBeforeToolCall).toHaveBeenCalled();
@@ -563,7 +641,7 @@ describe("session secrets at launch", () => {
   it("a command launched after the creator turned them off runs without them and says so once", async () => {
     const neverOn = await execToolInTurn(turn("bob"), { command: "echo ok" });
     await enable();
-    disableSessionSecrets(target(), "alice");
+    disableSessionSecrets(target(), people.alice);
     const afterOff = await execToolInTurn(turn("bob"), { command: "echo ok" });
     const later = await execToolInTurn(turn("bob"), { command: "echo ok" });
 
@@ -610,7 +688,7 @@ describe("session secrets at launch", () => {
 
   it("session secrets ending between lookup and spawn fail the launch closed", async () => {
     await enable();
-    mocks.beforeNativeSpawn = () => disableSessionSecrets(target(), "alice");
+    mocks.beforeNativeSpawn = () => disableSessionSecrets(target(), people.alice);
     const warnings: string[] = [];
     await expect(
       withGatewayToolCallerIdentity(turn("alice"), () =>
@@ -640,7 +718,7 @@ describe("session secrets at launch", () => {
     expect(delivered.env[KEY]).toBe(value);
     expect(otherAgent.env[KEY]).toBeUndefined();
     expect(mocks.spawnInputs.at(-1)?.env?.[KEY]).toBeUndefined();
-    expect(readSessionSecretsCreatorForTest(target())).toBe("alice");
+    expect(readSessionSecretsCreatorForTest(target())).toBe(people.alice);
     expectNoLeak({ ...delivered.surfaces, otherAgent: otherAgent.surfaces, otherStore });
   });
 
@@ -676,7 +754,7 @@ describe("session secrets at launch", () => {
 
   it("entryNames delivers only the selected entries", async () => {
     entries({ name: "A", kind: "env", value }, { name: "B", kind: "env", value: `b-${value}` });
-    await enable("alice", { entryNames: ["A"] });
+    await enable(people.alice, { entryNames: ["A"] });
     const { env, surfaces } = await launch(turn("alice"));
     expect(env.A).toBe(value);
     expect(env.B).toBeUndefined();

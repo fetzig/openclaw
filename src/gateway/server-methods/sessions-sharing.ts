@@ -11,7 +11,6 @@ import {
   type SessionSharingEvent,
   type SessionSharingEvidenceEvent,
 } from "../../../packages/gateway-protocol/src/index.js";
-import { endSessionSecretsIfSendersWiden } from "../../agents/session-secrets.js";
 import { addSessionMember, removeSessionMember } from "../../config/sessions.js";
 import { patchSessionEntryCore } from "../../config/sessions/session-accessor.js";
 import {
@@ -574,21 +573,10 @@ export const sessionSharingHandlers: GatewayRequestHandlers = {
           (entry) => {
             inspected = true;
             access.assertEntryManageable(entry);
-            const previous = resolveSessionVisibility(entry);
-            if (previous === visibility) {
+            if (resolveSessionVisibility(entry) === visibility) {
               return null;
             }
             changed = true;
-            // Ends before the commit: a failed commit leaves them off, never on for more senders.
-            endSessionSecretsIfSendersWiden(
-              {
-                storeScope: access.lifecycleStorePath,
-                agentId: current.agentId,
-                sessionKey: current.canonicalKey,
-              },
-              previous,
-              visibility,
-            );
             return { visibility };
           },
           sessionEntryCommitGuardOptions(commitGuard),

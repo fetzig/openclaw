@@ -2,16 +2,25 @@
  * Spike (openclaw#197297): creator-bound session secrets.
  *
  * The verified profile that created a session can turn on its personal entries for that
- * session. While on, every Gateway-host exec launch in the session gets them, whoever
- * prompted the turn. `secret` entries reach commands only as sentinels that the egress
+ * session. While on, every Gateway-host exec launch in the session gets them when its run
+ * acts for a person who may send there, whoever that is. `secret` entries reach commands only as sentinels that the egress
  * proxy resolves for their allowed hosts; `env` entries are plaintext. Values are read
  * from a provider at launch only and never stored here. State is process memory: a
  * Gateway restart turns everything off.
+ *
+ * Ending is one check at launch, never a hook per writer: the sharing owner decides who
+ * may send now, and secrets end once that reaches anyone it did not reach when they were
+ * turned on, or no longer reaches the creator.
  */
 import { GATEWAY_OWNER_PROFILE_ID } from "../../packages/gateway-protocol/src/schema/user-profile-constants.js";
-import { sessionCreatorProfileId } from "../config/sessions/session-entry-provenance.js";
+import { getRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import type { SessionEntry } from "../config/sessions/types.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { resolveOperatorRolePolicyForAssignment } from "../gateway/operator-role-policy.js";
+import { createSyntheticPluginRuntimeClient } from "../gateway/server-plugin-runtime-client.js";
 import { isSessionCreatorProfile } from "../gateway/session-creator.js";
+import { authorizePreparedSessionMutation } from "../gateway/session-sharing-policy.js";
+import { prepareSessionMutationFacts } from "../gateway/session-sharing-preparation.js";
 import { canonicalizeSessionKeyForAgent } from "../gateway/session-store-key.js";
 import {
   isDangerousHostEnvOverrideVarName,
@@ -32,6 +41,13 @@ import {
   isCurrentSessionControllerOperation,
 } from "../sessions/session-controller.identity.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+import {
+  listResidentUserProfileDisplayFacts,
+  prepareUserProfileCatalog,
+  readResidentUserProfileIdentity,
+} from "../state/user-profile-list.js";
+import type { AdmittedRunOperatorAuthority } from "./admitted-run-context.js";
+import { getInProcessGatewayToolContext } from "./tools/in-process-gateway.js";
 
 /**
  * One physical session: the session store it lives in, its agent and its key. The same
@@ -75,25 +91,22 @@ type SessionSecrets = {
    */
   readonly sessionId: string;
   readonly lifecycleRevision?: string;
+  /** Profiles that could send when they were turned on; anyone else who can send ends them. */
+  readonly senders: ReadonlySet<string>;
   /** sessionSecretsKey() of the session. */
   readonly key: string;
   readonly entryNames?: readonly string[];
 };
 
 export const SESSION_SECRETS_OFF_NOTICE = "Session secrets are off; this command ran without them.";
+export const SESSION_SECRETS_NO_PERSON_NOTICE =
+  "[REDACTED:secret-value] secrets were not provided: this run does not act for a person who may send in this session.";
 export const SESSION_SECRETS_ENDED_ERROR =
   "Session secrets ended before the command started; it was not run. Ask the session creator to turn them on again.";
 
 const MAX_ENTRIES = 64;
 /** OpenClaw-owned names that session secrets can never set, even when no reserved key covers them. */
 const OPENCLAW_OWNED_NAMES = new Set(["GH_TOKEN", "GITHUB_TOKEN", "PATH", "HOME"]);
-/**
- * Who can send, by visibility: Draft admits only the creator and admins; Read-only and
- * Suggest add invited members (an assigned owner gets no send right from that role);
- * Shared adds everyone who can see the session.
- */
-const SENDER_REACH = { draft: 0, "read-only": 1, suggest: 1, shared: 2 } as const;
-type SessionVisibility = keyof typeof SENDER_REACH;
 
 const state = resolveGlobalSingleton(Symbol.for("openclaw.sessionSecrets"), () => ({
   // storeScope \0 agentId \0 sessionKey -> the session's secrets while on
@@ -107,9 +120,9 @@ const agentOf = (target: SessionSecretsTarget) =>
   normalizeAgentId(target.agentId ?? target.sessionKey.trim().split(":")[1]);
 
 /**
- * The one registry key for a session, whoever names it: the enable request, the visibility
- * hook (sharing target) and the launch (session controller target). Keys are canonicalized
- * for their agent, so an alias such as `dashboard:x` and `agent:main:dashboard:x` agree.
+ * The one registry key for a session, whoever names it: the enable request and the launch
+ * (session controller target). Keys are canonicalized for their agent, so an alias such
+ * as `dashboard:x` and `agent:main:dashboard:x` agree.
  */
 export function sessionSecretsKey(target: SessionSecretsTarget): string {
   const agentId = agentOf(target);
@@ -117,14 +130,74 @@ export function sessionSecretsKey(target: SessionSecretsTarget): string {
   return `${target.storeScope.trim()}\0${agentId}\0${sessionKey}`;
 }
 
-async function loadEntry(target: SessionSecretsTarget) {
-  const { loadSessionEntry } = await import("../config/sessions/session-accessor.js");
+function currentConfig(): OpenClawConfig {
+  const gateway = getInProcessGatewayToolContext();
+  return (
+    (gateway ? (gateway.getCommittedRuntimeConfig ?? gateway.getRuntimeConfig)() : undefined) ??
+    getRuntimeConfigSnapshot() ??
+    {}
+  );
+}
+
+/**
+ * The session as the sharing owner sees it now, and who may send in it: for each verified
+ * person, the same check that admits their run in the session (visibility, membership,
+ * operator roles, config). Connection-level admins and token connections are not people
+ * and are left out; they can send in every session regardless.
+ */
+async function readSessionSenders(
+  target: SessionSecretsTarget,
+  person: Pick<AdmittedRunOperatorAuthority, "profileId" | "scopes"> | undefined,
+) {
+  const cfg = currentConfig();
   const agentId = agentOf(target);
-  return loadSessionEntry({
-    agentId,
-    sessionKey: canonicalizeSessionKeyForAgent(agentId, target.sessionKey.trim()),
-    storePath: target.storeScope,
-  });
+  const sessionKey = canonicalizeSessionKeyForAgent(agentId, target.sessionKey.trim());
+  const facts = await prepareSessionMutationFacts({ cfg, agentId, sessionKey });
+  const catalog = await prepareUserProfileCatalog();
+  try {
+    const current = facts.readCurrent(cfg);
+    const maySend = (profileId: string, scopes: readonly string[]) => {
+      const profile = readResidentUserProfileIdentity(profileId);
+      if (!profile || profile.profileId === GATEWAY_OWNER_PROFILE_ID) {
+        return false;
+      }
+      const client = createSyntheticPluginRuntimeClient({
+        operatorRoleActor: { kind: "operator", profileId },
+        scopes: [...scopes],
+      });
+      const policy = resolveOperatorRolePolicyForAssignment(
+        profile.profileId,
+        profile.role,
+        cfg,
+        profile.githubLogin ?? null,
+      );
+      return !authorizePreparedSessionMutation({ cfg, agentId, sessionKey, client }, current, {
+        policy,
+        aliases: profile.aliases,
+      });
+    };
+    const senders = new Set(
+      listResidentUserProfileDisplayFacts()
+        .map((profile) => profile.id)
+        .filter(
+          (id) =>
+            readResidentUserProfileIdentity(id)?.profileId === id &&
+            maySend(id, ["operator.write"]),
+        ),
+    );
+    return {
+      entry: current.target.entry,
+      senders,
+      /** The given person's canonical profile, when they may send in the session now. */
+      sender:
+        person && maySend(person.profileId, person.scopes)
+          ? readResidentUserProfileIdentity(person.profileId)?.profileId
+          : undefined,
+    };
+  } finally {
+    catalog.release();
+    facts.release();
+  }
 }
 
 function end(key: string): void {
@@ -135,23 +208,18 @@ function end(key: string): void {
 
 /**
  * Only the session's write-once creator, when it is a verified person's Gateway profile,
- * may turn session secrets on; a profile merged with the creator counts as the creator.
- * Channel senders, agents, automations, delegated creations, child sessions and the shared
- * Gateway owner profile (every token or password connection) have none. The assignable
- * owner never counts.
+ * may turn session secrets on, by upstream's creator rule: a profile merged with the
+ * creator and a creation an agent made for the person count; child and cron sessions
+ * qualify the same way. Channel senders, agents, automations and the shared Gateway owner
+ * profile (every token or password connection) have none. The assignable owner never counts.
  */
 export function isSessionSecretsCreator(
-  entry: Pick<SessionEntry, "createdActor" | "spawnedBy" | "parentSessionKey"> | undefined,
+  entry: Pick<SessionEntry, "createdActor"> | undefined,
   requesterProfileId: string,
 ): boolean {
-  const actor = entry?.createdActor;
-  if (!actor || actor.delegatedBy || entry.spawnedBy || entry.parentSessionKey) {
-    return false;
-  }
   return (
     requesterProfileId !== GATEWAY_OWNER_PROFILE_ID &&
-    sessionCreatorProfileId(actor) !== GATEWAY_OWNER_PROFILE_ID &&
-    isSessionCreatorProfile(actor, requesterProfileId)
+    isSessionCreatorProfile(entry?.createdActor, requesterProfileId)
   );
 }
 
@@ -164,8 +232,19 @@ export async function enableSessionSecretsForTest(params: {
   target: SessionSecretsTarget;
   entryNames?: readonly string[];
 }): Promise<void> {
-  const entry = await loadEntry(params.target);
-  if (!entry?.sessionId || !isSessionSecretsCreator(entry, params.requesterProfileId)) {
+  const read = await readSessionSenders(params.target, {
+    profileId: params.requesterProfileId,
+    scopes: ["operator.write"],
+  }).catch(() => undefined);
+  const { entry, senders, sender } = read ?? {};
+  // The creator must also be able to send now; secrets start off and are never inherited.
+  if (
+    !entry?.sessionId ||
+    !senders ||
+    !isSessionSecretsCreator(entry, params.requesterProfileId) ||
+    !sender ||
+    !senders.has(sender)
+  ) {
     throw new Error("Only the session's creator can turn on session secrets.");
   }
   const key = sessionSecretsKey(params.target);
@@ -174,6 +253,7 @@ export async function enableSessionSecretsForTest(params: {
     creatorProfileId: params.requesterProfileId,
     sessionId: entry.sessionId,
     ...(entry.lifecycleRevision ? { lifecycleRevision: entry.lifecycleRevision } : {}),
+    senders,
     key,
     ...(params.entryNames ? { entryNames: Object.freeze([...params.entryNames]) } : {}),
   });
@@ -187,17 +267,6 @@ export function disableSessionSecrets(
   const key = sessionSecretsKey(target);
   if (state.sessions.get(key)?.creatorProfileId === requesterProfileId) {
     end(key);
-  }
-}
-
-/** A visibility change that lets more people send ends session secrets from the next launch. */
-export function endSessionSecretsIfSendersWiden(
-  target: SessionSecretsTarget,
-  previous: SessionVisibility,
-  next: SessionVisibility,
-): void {
-  if (SENDER_REACH[next] > SENDER_REACH[previous]) {
-    end(sessionSecretsKey(target));
   }
 }
 
@@ -293,6 +362,8 @@ export async function resolveSessionSecretsLaunch(
     secretEgressBindings?: readonly SecretEgressSentinelBinding[];
     warnings: string[];
   }>,
+  /** The launching run's operator authority: the person it acts for, if any. */
+  operatorAuthority?: Pick<AdmittedRunOperatorAuthority, "profileId" | "scopes">,
 ): Promise<
   | {
       env: Record<string, string>;
@@ -308,13 +379,20 @@ export async function resolveSessionSecretsLaunch(
   }
   const key = sessionSecretsKey(target);
   let secrets = state.sessions.get(key);
-  // A reset or replaced session is a new incarnation: they end. One entry read per launch.
-  const current = secrets ? await loadEntry(target) : undefined;
+  // One read of the session and its senders per launch, only while they are on.
+  const current = secrets
+    ? await readSessionSenders(target, operatorAuthority).catch(() => undefined)
+    : undefined;
   if (
     secrets &&
-    (secrets.sessionId !== launch.sessionId ||
-      current?.sessionId !== secrets.sessionId ||
-      current.lifecycleRevision !== secrets.lifecycleRevision)
+    // A reset or replaced session is a new incarnation, and an unreadable one ends them too.
+    (!current ||
+      secrets.sessionId !== launch.sessionId ||
+      current.entry.sessionId !== secrets.sessionId ||
+      current.entry.lifecycleRevision !== secrets.lifecycleRevision ||
+      // More people can send now, or the creator no longer can.
+      [...current.senders].some((id) => !secrets!.senders.has(id)) ||
+      !current.senders.has(secrets.creatorProfileId))
   ) {
     end(key);
     secrets = undefined;
@@ -324,6 +402,11 @@ export async function resolveSessionSecretsLaunch(
     if (state.ended.delete(key)) {
       launch.warnings.push(SESSION_SECRETS_OFF_NOTICE);
     }
+    return undefined;
+  }
+  // Only a run acting for a person who may send in this session gets them.
+  if (!current?.sender) {
+    launch.warnings.push(SESSION_SECRETS_NO_PERSON_NOTICE);
     return undefined;
   }
   const unsupported = launch.sandbox ? "sandbox" : launch.durable ? "durable" : undefined;

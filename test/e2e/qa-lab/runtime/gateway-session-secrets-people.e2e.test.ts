@@ -14,6 +14,7 @@ import {
   enableSessionSecretsForTest,
   readSessionSecretsCreatorForTest,
   resetSessionSecretsForTest,
+  SESSION_SECRETS_NO_PERSON_NOTICE,
   SESSION_SECRETS_OFF_NOTICE,
   setSessionSecretValueProviderForTest,
 } from "../../../../src/agents/session-secrets.js";
@@ -164,12 +165,14 @@ async function prepare(gateway: People, sessionStore?: string) {
     profileId: profile.id,
     creator: () => readSessionSecretsCreatorForTest(target),
     /** Values may reach only the spawned process and the allowed host: never chat, events, model, logs or disk. */
-    expectNoLeak: async (historyBeforeReset?: unknown) => {
+    expectNoLeak: async (
+      options: { historyBeforeReset?: unknown; historyShowsProbe?: boolean } = {},
+    ) => {
       for (const restore of restoreWrites) {
         restore();
       }
       const surfaces: Record<string, unknown> = {
-        "chat.history": [historyBeforeReset, await session.history()],
+        "chat.history": [options.historyBeforeReset, await session.history()],
         "Gateway events": gateway.events,
         "model requests": gateway.model.requests,
         "log records": logs,
@@ -181,7 +184,11 @@ async function prepare(gateway: People, sessionStore?: string) {
         }
       }
       // Positive controls: these surfaces carry the command's output, so a value would show.
-      for (const name of ["chat.history", "model requests"]) {
+      // Scheduled runs record only their result in chat.history, not tool output.
+      for (const name of [
+        ...(options.historyShowsProbe === false ? [] : ["chat.history"]),
+        "model requests",
+      ]) {
         expect(JSON.stringify(surfaces[name]), `${name} lacks the probe output`).toContain(
           plainHash,
         );
@@ -311,7 +318,7 @@ it(
         "Bearer",
         undefined,
       ]);
-      await expectNoLeak(historyBeforeReset);
+      await expectNoLeak({ historyBeforeReset });
     }),
 );
 
@@ -352,11 +359,13 @@ it(
       const aliceTurn = await session.send("Alice runs the check in her draft.");
       expect(await session.wait(aliceTurn.runId)).toMatchObject({ status: "ok" });
       await setVisibility("shared");
-      expect(creator()).toBeUndefined();
+      // Ending is one check at launch: status reads on until the next command starts.
+      expect(creator()).toBe(profileId);
 
       const bob = await gateway.connectAs(BOB);
       const bobTurn = await session.send("Bob runs the check after Alice shared it.", bob);
       expect(await session.wait(bobTurn.runId)).toMatchObject({ status: "ok" });
+      expect(creator()).toBeUndefined();
       const [draft, shared] = execOutputs(session);
       expect(line(draft!, "plain")).toBe(`present:${plainHash}`);
       expect(line(draft!, "secret-env")).toMatch(/^oc-sent-v2\./);
@@ -364,5 +373,124 @@ it(
       expect(line(shared!, "plain")).toBe("absent");
       expect(shared).toContain(SESSION_SECRETS_OFF_NOTICE);
       await expectNoLeak();
+    }),
+);
+
+type CronRun = { ok: boolean; enqueued: boolean; runId: string };
+type CronJobRow = { id: string; name: string };
+
+it(
+  "cron: Alice's job in her session gets them; isolated, current and Bob's jobs get nothing",
+  { timeout: TEST_TIMEOUT_MS },
+  () =>
+    withPeopleGateway({ ...PEOPLE_GATEWAY, cron: true }, async (gateway) => {
+      const origins = await startOrigins(gateway.home);
+      const { plainHash, secretValue, session, target, profileId, creator, expectNoLeak } =
+        await prepare(gateway);
+      const command = probe(origins);
+      type Turn = Parameters<typeof gateway.model.script>[number];
+      const reply =
+        (text: string): Turn =>
+        async (_request, response) =>
+          replyText(response, text);
+      const exec: Turn = async (_request, response) => writeToolCall(response, "exec", { command });
+      // Jobs are scheduled from a person's own turn, which records that person as the
+      // job's operator source; its runs act for them.
+      const schedule =
+        (name: string, job: object): Turn =>
+        async (_request, response) =>
+          writeToolCall(response, "automations", {
+            action: "add",
+            job: {
+              name,
+              schedule: { kind: "every", everyMs: 86_400_000 },
+              payload: { kind: "agentTurn", message: `${name}: run the vault check.` },
+              delivery: { mode: "none" },
+              ...job,
+            },
+          });
+      const bobSession = gateway.session();
+      gateway.model.script(
+        reply("Draft created."),
+        schedule("Alice's session job", { sessionTarget: `session:${session.sessionKey}` }),
+        schedule("Alice's isolated job", { sessionTarget: "isolated" }),
+        schedule("Alice's current job", { sessionTarget: "current" }),
+        reply("Alice scheduled three jobs."),
+        exec,
+        reply("Alice's session job ran."),
+        exec,
+        reply("Alice's isolated job ran."),
+        exec,
+        reply("Alice's current job ran."),
+        schedule("Bob's job", { sessionTarget: `session:${session.sessionKey}` }),
+        reply("Bob scheduled a job."),
+        exec,
+        reply("Bob's job ran."),
+      );
+      const created = await session.send("Alice opens a draft for scheduled checks.");
+      expect(await session.wait(created.runId)).toMatchObject({ status: "ok" });
+      await gateway.alice.request("session.visibility.set", {
+        sessionKey: session.sessionKey,
+        visibility: "draft",
+      });
+      await enableSessionSecretsForTest({ requesterProfileId: profileId, target });
+      const scheduled = await session.send("Alice schedules her vault checks.");
+      expect(await session.wait(scheduled.runId)).toMatchObject({ status: "ok" });
+
+      /** Runs a job now as `client` and returns the exec output its turn produced. */
+      const runJob = async (client: typeof gateway.alice, name: string) => {
+        const { jobs } = await client.request<{ jobs: CronJobRow[] }>("cron.list", {
+          includeDisabled: true,
+        });
+        const job = jobs.find((candidate) => candidate.name === name);
+        expect(job, name).toBeDefined();
+        const run = await client.request<CronRun>("cron.run", { id: job!.id, mode: "force" });
+        expect(run, name).toMatchObject({ ok: true, enqueued: true });
+        await expect
+          .poll(
+            async () =>
+              (
+                await client.request<{ entries: Array<{ runId?: string; status?: string }> }>(
+                  "cron.runs",
+                  { id: job!.id, runId: run.runId, limit: 1 },
+                )
+              ).entries.find((entry) => entry.runId === run.runId)?.status,
+            { timeout: 60_000, interval: 250 },
+          )
+          .toBe("ok");
+        return execOutputs({ requests: () => gateway.model.requests }).at(-1)!;
+      };
+
+      const inSession = await runJob(gateway.alice, "Alice's session job");
+      expect(line(inSession, "secret-env")).toMatch(/^oc-sent-v2\./);
+      expect(line(inSession, "plain")).toBe(`present:${plainHash}`);
+      expect(origins.received[0]).toEqual({
+        host: ALLOWED_HOST,
+        path: "/allowed",
+        authorization: `Bearer ${secretValue}`,
+      });
+      // A fresh session per run: secrets start off there and are never inherited. The run
+      // still acts for Alice, so this is not the no-person refusal.
+      for (const name of ["Alice's isolated job", "Alice's current job"]) {
+        const output = await runJob(gateway.alice, name);
+        expect(line(output, "secret-env"), name).toBe("");
+        expect(line(output, "plain"), name).toBe("absent");
+        expect(output, name).not.toContain(SESSION_SECRETS_NO_PERSON_NOTICE);
+      }
+
+      // Bob cannot send in Alice's Draft, yet cron lets him schedule a job into it (as of
+      // this spike, cron does not check session sharing). The job's run acts for him.
+      const bob = await gateway.connectAs(BOB);
+      const bobTurn = await bobSession.send("Bob schedules a check in Alice's draft.", bob);
+      expect(await bobSession.wait(bobTurn.runId)).toMatchObject({ status: "ok" });
+      const bobRun = await runJob(bob, "Bob's job");
+      expect(line(bobRun, "secret-env")).toBe("");
+      expect(line(bobRun, "plain")).toBe("absent");
+      expect(bobRun).toContain(SESSION_SECRETS_NO_PERSON_NOTICE);
+      expect(
+        origins.received.filter((request) => request.authorization === `Bearer ${secretValue}`),
+      ).toHaveLength(1);
+      expect(creator()).toBe(profileId);
+      await expectNoLeak({ historyShowsProbe: false });
     }),
 );

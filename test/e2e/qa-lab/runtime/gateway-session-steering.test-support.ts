@@ -594,6 +594,8 @@ export async function withPeopleGateway(
     secrets?: OpenClawConfig["secrets"];
     /** A custom `session.store`, such as `~/sessions/{agentId}/sessions.json`. */
     sessionStore?: string;
+    /** Start the cron service, which isolated Gateways skip. */
+    cron?: boolean;
   },
   run: (
     gateway: SteeringApi & {
@@ -633,6 +635,7 @@ export async function withPeopleGateway(
     https_proxy: undefined,
     NO_PROXY: "127.0.0.1,localhost",
     no_proxy: "127.0.0.1,localhost",
+    ...(options.cron ? { OPENCLAW_SKIP_CRON: undefined } : {}),
   };
   try {
     await withEnvAsync(env, async () => {

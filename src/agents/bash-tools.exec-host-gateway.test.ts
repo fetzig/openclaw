@@ -1423,6 +1423,11 @@ describe("processGatewayAllowlist", () => {
         prefix: "openclaw-approval-session-secrets-",
         layout: "state-only",
       });
+      const { ensureProfileForEmail } = await import("../state/user-profiles.js");
+      const { prepareUserProfileCatalog } = await import("../state/user-profile-list.js");
+      // Session secrets need a verified person who may send in the session.
+      const alice = ensureProfileForEmail("alice@example.test").id;
+      const catalog = await prepareUserProfileCatalog();
       const value = `vt-${crypto.randomUUID()}`;
       const sessionKey = "agent:main:approval-grant";
       const sessionId = "approval-grant-session";
@@ -1433,14 +1438,14 @@ describe("processGatewayAllowlist", () => {
         {
           sessionId,
           updatedAt: Date.now(),
-          createdActor: { type: "human", source: "profile", id: "alice" },
+          createdActor: { type: "human", source: "profile", id: alice },
         },
       );
       secrets.resetSessionSecretsForTest();
       secrets.setSessionSecretValueProviderForTest({
         readEntries: () => [{ name: "VAULT_TEST_TOKEN", kind: "env", value }],
       });
-      await secrets.enableSessionSecretsForTest({ requesterProfileId: "alice", target });
+      await secrets.enableSessionSecretsForTest({ requesterProfileId: alice, target });
       const operatorAuthority = (profileId: string) =>
         createAdmittedRunOperatorAuthority({ profileId, scopes: [], assertCurrent: () => {} });
       const approval = createDeferredCore<ExecApprovalDecision>();
@@ -1476,7 +1481,7 @@ describe("processGatewayAllowlist", () => {
         {
           agentId: "main",
           sessionKey,
-          operatorAuthority: operatorAuthority("alice"),
+          operatorAuthority: operatorAuthority(alice),
           operationalRunInstance: createOperationalRunInstanceRef("run-grant"),
         },
         () =>
@@ -1491,7 +1496,7 @@ describe("processGatewayAllowlist", () => {
       );
       await vi.waitFor(() => expect(approvalDecisionMock).toHaveBeenCalledOnce());
       if (revocation === "creator-disables") {
-        secrets.disableSessionSecrets(target, "alice");
+        secrets.disableSessionSecrets(target, alice);
       }
       approval.resolve("allow-once");
       await vi.waitFor(() => expect(spawned).toHaveLength(1));
@@ -1513,6 +1518,7 @@ describe("processGatewayAllowlist", () => {
       }
       secrets.setSessionSecretValueProviderForTest(undefined);
       secrets.resetSessionSecretsForTest();
+      catalog.release();
       await state.cleanup();
     },
   );
