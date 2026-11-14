@@ -579,12 +579,10 @@ export async function runExecProcess({
       const assertOperatorCurrent = operatorAuthority?.assertCurrent;
       const assertRuntimeCurrent = assertSandboxCurrent;
       const assertHostPolicyCurrent = assertPolicyCurrent;
-      let sessionSecrets: Awaited<ReturnType<typeof resolveSessionSecretsLaunch>> = undefined;
       const assertCurrent = () => {
         assertSourceCurrent?.();
         assertOperatorCurrent?.();
         assertRuntimeCurrent?.();
-        sessionSecrets?.assertCurrent();
       };
       // Source authority covers construction; approval policy ends at native launch.
       assertCurrent();
@@ -594,7 +592,7 @@ export async function runExecProcess({
           "Durable exec requires noninteractive Gateway-host execution without secret-egress proxy grants. Use non-durable background exec or a directly provided credential.",
         );
       }
-      sessionSecrets = await resolveSessionSecretsLaunch(opts, operatorAuthority);
+      const sessionSecrets = await resolveSessionSecretsLaunch(opts);
       const bindings = sessionSecrets ? sessionSecrets.bindings : opts.secretEgressBindings;
       const grant = bindings ? await registerSecretEgressProxyProcess(bindings) : undefined;
       // Egress proxy settings are OpenClaw-owned and win over session secrets.

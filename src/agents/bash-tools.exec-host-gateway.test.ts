@@ -1412,9 +1412,9 @@ describe("processGatewayAllowlist", () => {
     expectNoCalls(commitAuthorizationMock, runExecProcessMock, followupMock);
   });
 
-  it.each(["none", "creator-disables"] as const)(
-    "8: resolves session secrets only at the deferred launch (during the wait: %s)",
-    async (revocation) => {
+  it.each(["nothing", "Alice replaced her entry with an invalid one"] as const)(
+    "8: reads session secrets only at the deferred launch (during the wait: %s)",
+    async (change) => {
       const secrets = await import("./session-secrets.js");
       const { createOpenClawTestState } = await import("../test-utils/openclaw-test-state.js");
       const { replaceSessionEntry } = await import("../config/sessions/session-accessor.js");
@@ -1425,7 +1425,7 @@ describe("processGatewayAllowlist", () => {
       });
       const { ensureProfileForEmail } = await import("../state/user-profiles.js");
       const { prepareUserProfileCatalog } = await import("../state/user-profile-list.js");
-      // Session secrets need a verified person who may send in the session.
+      // Session secrets need a session created by a verified person.
       const alice = ensureProfileForEmail("alice@example.test").id;
       const catalog = await prepareUserProfileCatalog();
       const value = `vt-${crypto.randomUUID()}`;
@@ -1441,11 +1441,11 @@ describe("processGatewayAllowlist", () => {
           createdActor: { type: "human", source: "profile", id: alice },
         },
       );
-      secrets.resetSessionSecretsForTest();
+      let vault = [{ name: "VAULT_TEST_TOKEN", kind: "env" as const, value }];
       secrets.setSessionSecretValueProviderForTest({
-        readEntries: () => [{ name: "VAULT_TEST_TOKEN", kind: "env", value }],
+        listNames: () => vault.map((entry) => entry.name),
+        readEntries: () => vault,
       });
-      await secrets.enableSessionSecretsForTest({ requesterProfileId: alice, target });
       const operatorAuthority = (profileId: string) =>
         createAdmittedRunOperatorAuthority({ profileId, scopes: [], assertCurrent: () => {} });
       const approval = createDeferredCore<ExecApprovalDecision>();
@@ -1495,17 +1495,18 @@ describe("processGatewayAllowlist", () => {
           }),
       );
       await vi.waitFor(() => expect(approvalDecisionMock).toHaveBeenCalledOnce());
-      if (revocation === "creator-disables") {
-        secrets.disableSessionSecrets(target, alice);
+      if (change !== "nothing") {
+        vault = [{ name: "bad-name", kind: "env", value: `bad-${value}` }];
       }
       approval.resolve("allow-once");
       await vi.waitFor(() => expect(spawned).toHaveLength(1));
       await waitForFollowup();
 
-      expect(spawned[0]?.VAULT_TEST_TOKEN).toBe(revocation === "none" ? value : undefined);
+      expect(spawned[0]?.VAULT_TEST_TOKEN).toBe(change === "nothing" ? value : undefined);
+      // Warnings from the deferred launch reach the follow-up, not only the pending result.
       expect(
-        JSON.stringify(followupMock.mock.calls).includes(secrets.SESSION_SECRETS_OFF_NOTICE),
-      ).toBe(revocation === "creator-disables");
+        JSON.stringify(followupMock.mock.calls).includes("one entry with an invalid name"),
+      ).toBe(change !== "nothing");
       for (const [name, surface] of Object.entries({
         approvalRequests: gatewayMock.mock.calls,
         warnings,
@@ -1517,7 +1518,6 @@ describe("processGatewayAllowlist", () => {
         expect(JSON.stringify(surface), name).not.toContain(value);
       }
       secrets.setSessionSecretValueProviderForTest(undefined);
-      secrets.resetSessionSecretsForTest();
       catalog.release();
       await state.cleanup();
     },
