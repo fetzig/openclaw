@@ -42,6 +42,7 @@ import {
 import { parseThreadSessionSuffix } from "../sessions/session-key-utils.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { readResidentUserProfileIdentity } from "../state/user-profile-list.js";
+import { isInternalMessageChannel } from "../utils/message-channel.js";
 import { getInProcessGatewayToolContext } from "./tools/in-process-gateway.js";
 
 /**
@@ -157,8 +158,10 @@ function isChannelRoutedSession(cfg: OpenClawConfig, target: SessionSecretsTarge
 
 /**
  * Conversation bindings route a channel conversation to any key: thread-bound subagents,
- * plugin binds, migrated bindings. A bound session gets nothing, and so does one whose
- * bindings cannot be listed. A binding made after a launch applies from the next launch.
+ * plugin binds, migrated bindings. A session bound to an external channel gets nothing, and
+ * so does one whose bindings cannot be listed. Bindings to the internal channel are the
+ * Control UI itself (a plugin session catalog binds a continued session to it), so they do
+ * not count. A binding made after a launch applies from the next launch.
  */
 async function isBoundToConversation(target: SessionSecretsTarget): Promise<boolean> {
   const agentId = agentOf(target);
@@ -168,7 +171,7 @@ async function isBoundToConversation(target: SessionSecretsTarget): Promise<bool
     const bindings = await listSessionBindingsBySessionAsync(
       canonicalizeSessionKeyForAgent(agentId, target.sessionKey.trim()),
     );
-    return bindings.length > 0;
+    return bindings.some((binding) => !isInternalMessageChannel(binding.conversation.channel));
   } catch {
     return true;
   }

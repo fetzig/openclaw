@@ -39,6 +39,7 @@ import {
   createOpenClawTestState,
   type OpenClawTestState,
 } from "../test-utils/openclaw-test-state.js";
+import { INTERNAL_MESSAGE_CHANNEL } from "../utils/message-channel-constants.js";
 import { createAdmittedRunOperatorAuthority } from "./admitted-run-context.js";
 import { resetProcessRegistryForTests } from "./bash-process-registry.test-support.js";
 import type { CapturedEnvironment } from "./bash-tools.exec-env.test-support.js";
@@ -632,14 +633,16 @@ function installBindingOwner() {
     touchAsync: async () => {},
   };
   registerSessionBindingAdapterV2(adapter);
-  const bind = (targetSessionKey: string, metadata?: Record<string, unknown>) =>
+  // In a Gateway, internal-channel bindings live in the generic store (mocked here); the
+  // service merges every owner's records, so this owner can stand in for either.
+  const bind = (targetSessionKey: string, metadata?: Record<string, unknown>, channel = "matrix") =>
     bindings.push({
       bindingId: `binding-${randomUUID()}`,
       targetSessionKey,
       targetKind: "session",
       status: "active",
       boundAt: Date.now(),
-      conversation: { channel: "matrix", accountId: "default", conversationId: "!room:example" },
+      conversation: { channel, accountId: "default", conversationId: `${channel}-${randomUUID()}` },
       ...(metadata ? { metadata } : {}),
     });
   return {
@@ -695,6 +698,24 @@ describe("sessions bound to a channel conversation use no one's secrets", () => 
     // Like a creator without entries: nothing is said.
     expect([whileBound, control, afterUnbind].flatMap(({ warnings }) => warnings)).toEqual([]);
     expectNoLeak({ ...whileBound.surfaces, status: whileBound.status });
+  });
+
+  it("a binding to the internal channel alone does not count; one external binding does", async () => {
+    // A plugin session catalog binds a continued session to its own Control UI conversation.
+    const catalog = await aliceSession();
+    owner.bind(catalog, { pluginBindingOwner: "plugin" }, INTERNAL_MESSAGE_CHANNEL);
+    const internalOnly = await probe(catalog);
+    const both = await aliceSession();
+    owner.bind(both, undefined, INTERNAL_MESSAGE_CHANNEL);
+    owner.bind(both, undefined, "slack");
+    const withExternal = await probe(both);
+
+    expect(internalOnly.values).toEqual([value, value, value]);
+    expect(internalOnly.status?.creatorProfileId).toBe(people.alice);
+    expect(withExternal.values).toEqual([undefined, undefined, undefined]);
+    expect(withExternal.status).toBeUndefined();
+    expect([...internalOnly.warnings, ...withExternal.warnings]).toEqual([]);
+    expectNoLeak({ ...withExternal.surfaces, status: withExternal.status });
   });
 
   it("a dashboard session a plugin bound gets nothing, sandboxed launches silently", async () => {

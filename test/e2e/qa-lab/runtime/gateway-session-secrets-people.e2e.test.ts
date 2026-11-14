@@ -17,7 +17,13 @@ import {
 import { resolveSessionStorePathCore } from "../../../../src/config/sessions/paths.js";
 import { loadSessionEntry } from "../../../../src/config/sessions/session-accessor.js";
 import { listDirectoryTreeStrict } from "../../../../src/infra/directory-walk.js";
-import { getSessionBindingService } from "../../../../src/infra/outbound/session-binding-service.js";
+import {
+  getSessionBindingService,
+  registerSessionBindingAdapterV2,
+  unregisterSessionBindingAdapter,
+  type SessionBindingAdapterV2,
+  type SessionBindingRecord,
+} from "../../../../src/infra/outbound/session-binding-service.js";
 import {
   getLogger,
   getResolvedLoggerFileTarget,
@@ -25,6 +31,7 @@ import {
   setLoggerOverride,
 } from "../../../../src/logging/logger.js";
 import { generateLocalProxyLeaf } from "../../../../src/proxy-capture/ca.js";
+import { INTERNAL_MESSAGE_CHANNEL } from "../../../../src/utils/message-channel-constants.js";
 import {
   BOB,
   replyText,
@@ -345,7 +352,7 @@ it(
 );
 
 it(
-  "the main session and a bound session get none of Alice's entries; her dashboard session does",
+  "the main session and a Slack-bound session get none of Alice's entries; webchat-bound and dashboard do",
   { timeout: TEST_TIMEOUT_MS },
   () =>
     withPeopleGateway(PEOPLE_GATEWAY, async (gateway) => {
@@ -361,7 +368,9 @@ it(
         async (_request, response) => writeToolCall(response, "exec", { command }),
         async (_request, response) => replyText(response, "The dashboard check ran."),
         async (_request, response) => writeToolCall(response, "exec", { command }),
-        async (_request, response) => replyText(response, "The bound check ran."),
+        async (_request, response) => replyText(response, "The webchat-bound check ran."),
+        async (_request, response) => writeToolCall(response, "exec", { command }),
+        async (_request, response) => replyText(response, "The Slack-bound check ran."),
         async (_request, response) => writeToolCall(response, "exec", { command }),
         async (_request, response) => replyText(response, "The unbound check ran."),
       );
@@ -408,31 +417,47 @@ it(
         [DENIED_HOST, "/control", undefined],
       ]);
 
-      // A conversation binding routes that conversation into the session, as a plugin or a
-      // thread-bound spawn does; the real binding store answers the launch's query.
-      const bindingService = getSessionBindingService();
-      const binding = await bindingService.bind({
+      // A plugin session catalog binds a continued session to the Control UI's own
+      // (internal) conversation, through the real binding store: that does not count.
+      await getSessionBindingService().bind({
         targetSessionKey: session.sessionKey,
         targetKind: "session",
-        conversation: { channel: "webchat", accountId: "default", conversationId: randomUUID() },
+        conversation: {
+          channel: INTERNAL_MESSAGE_CHANNEL,
+          accountId: "default",
+          conversationId: session.sessionKey,
+        },
         placement: "current",
       });
-      const inBound = await session.send("Alice runs the check while the session is bound.");
-      expect(await session.wait(inBound.runId)).toMatchObject({ status: "ok" });
-      const boundOutput = lastExec(gateway);
-      const boundStatus = await status(profileId);
-      await bindingService.unbind({ bindingId: binding.bindingId, reason: "e2e" });
-      const inUnbound = await session.send("Alice runs the check after unbinding.");
+      const inInternal = await session.send("Alice runs the check while bound to webchat.");
+      expect(await session.wait(inInternal.runId)).toMatchObject({ status: "ok" });
+      const internalOutput = lastExec(gateway);
+      const internalStatus = await status(profileId);
+      // An external channel's binding owner (as Slack's thread bindings register one in the
+      // Gateway process) routes a Slack thread into the same session: that does.
+      const slack = bindSlackThread(session.sessionKey);
+      const inExternal = await session.send("Alice runs the check while a Slack thread is bound.");
+      expect(await session.wait(inExternal.runId)).toMatchObject({ status: "ok" });
+      const externalOutput = lastExec(gateway);
+      const externalStatus = await status(profileId);
+      slack.unbind();
+      const inUnbound = await session.send("Alice runs the check after the Slack thread unbound.");
       expect(await session.wait(inUnbound.runId)).toMatchObject({ status: "ok" });
       const unboundOutput = lastExec(gateway);
+      slack.uninstall();
 
-      expect(boundStatus).toBeUndefined();
-      expect(line(boundOutput, "secret-env")).toBe("");
-      expect(line(boundOutput, "plain")).toBe("absent");
-      expect(boundOutput).not.toContain("Session secrets");
-      expect(line(unboundOutput, "secret-env")).toMatch(/^oc-sent-v2\./);
-      expect(line(unboundOutput, "plain")).toBe(`present:${plainHash}`);
+      expect(internalStatus?.creatorProfileId).toBe(profileId);
+      expect(externalStatus).toBeUndefined();
+      for (const output of [internalOutput, unboundOutput]) {
+        expect(line(output, "secret-env")).toMatch(/^oc-sent-v2\./);
+        expect(line(output, "plain")).toBe(`present:${plainHash}`);
+      }
+      expect(line(externalOutput, "secret-env")).toBe("");
+      expect(line(externalOutput, "plain")).toBe("absent");
+      expect(externalOutput).not.toContain("Session secrets");
       expect(origins.received.slice(5).map(({ authorization }) => authorization)).toEqual([
+        `Bearer ${secretValue}`,
+        undefined,
         "Bearer",
         "Bearer",
         undefined,
@@ -442,6 +467,47 @@ it(
       await expectNoLeak();
     }),
 );
+
+/**
+ * A Slack binding owner holding one thread bound to `sessionKey`, registered in the
+ * Gateway's process-wide adapter registry as a channel's thread bindings would be.
+ */
+function bindSlackThread(sessionKey: string) {
+  const bindings: SessionBindingRecord[] = [
+    {
+      bindingId: `slack-${randomUUID()}`,
+      targetSessionKey: sessionKey,
+      targetKind: "session",
+      status: "active",
+      boundAt: Date.now(),
+      conversation: { channel: "slack", accountId: "default", conversationId: "C0123:1700.0001" },
+    },
+  ];
+  const listBySession = (key: string) =>
+    bindings.filter((binding) => binding.targetSessionKey === key);
+  const adapter: SessionBindingAdapterV2 = {
+    version: 2,
+    channel: "slack",
+    accountId: "default",
+    assertCurrent: () => {},
+    listBySession,
+    listBySessionAsync: async (key) => listBySession(key),
+    resolveByConversation: () => null,
+    resolveByConversationAsync: async () => null,
+    inspectByConversationAsync: async () => null,
+    inspectByConversationsAsync: async (refs) => ({
+      bindings: refs.map(() => null),
+      assertCurrent: () => {},
+    }),
+    touchAsync: async () => {},
+  };
+  registerSessionBindingAdapterV2(adapter);
+  return {
+    unbind: () => void bindings.splice(0),
+    uninstall: () =>
+      unregisterSessionBindingAdapter({ channel: "slack", accountId: "default", adapter }),
+  };
+}
 
 type CronRun = { ok: boolean; enqueued: boolean; runId: string };
 type CronJobRow = { id: string; name: string };
