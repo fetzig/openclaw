@@ -15,6 +15,7 @@ import {
   type SessionSecretEntry,
 } from "../../../../src/agents/session-secrets.js";
 import { resolveSessionStorePathCore } from "../../../../src/config/sessions/paths.js";
+import { loadSessionEntry } from "../../../../src/config/sessions/session-accessor.js";
 import { listDirectoryTreeStrict } from "../../../../src/infra/directory-walk.js";
 import {
   getLogger,
@@ -334,6 +335,69 @@ it(
         origins.received.filter((request) => request.authorization === `Bearer ${secretValue}`),
       ).toHaveLength(3);
       await expectNoLeak({ historyBeforeReset });
+    }),
+);
+
+it(
+  "the agent's main session Alice created gets none of her entries; her dashboard session does",
+  { timeout: TEST_TIMEOUT_MS },
+  () =>
+    withPeopleGateway(PEOPLE_GATEWAY, async (gateway) => {
+      const origins = await startOrigins(gateway.home);
+      const { plainHash, secretValue, session, target, profileId, status, expectNoLeak } =
+        await prepare(gateway);
+      // Channel DMs route here under the default dmScope "main".
+      const main = gateway.session("agent:main:main");
+      const command = probe(origins);
+      gateway.model.script(
+        async (_request, response) => writeToolCall(response, "exec", { command }),
+        async (_request, response) => replyText(response, "The main-session check ran."),
+        async (_request, response) => writeToolCall(response, "exec", { command }),
+        async (_request, response) => replyText(response, "The dashboard check ran."),
+      );
+
+      const inMain = await main.send("Alice runs the vault check in the agent's main session.");
+      expect(await main.wait(inMain.runId)).toMatchObject({ status: "ok" });
+      const mainOutput = lastExec(gateway);
+      // Alice's message created the main session, so the creator rule alone would apply.
+      const mainTarget = { ...target, sessionKey: main.sessionKey };
+      expect(
+        loadSessionEntry({
+          agentId: "main",
+          sessionKey: main.sessionKey,
+          storePath: target.storeScope,
+        })?.createdActor,
+      ).toMatchObject({ type: "human", source: "profile", id: profileId });
+      expect(await readSessionSecretsStatus(mainTarget, profileId)).toBeUndefined();
+      expect(line(mainOutput, "secret-env")).toBe("");
+      expect(line(mainOutput, "plain")).toBe("absent");
+      expect(mainOutput).not.toContain("Session secrets");
+
+      const inDashboard = await session.send(
+        "Alice runs the vault check in her dashboard session.",
+      );
+      expect(await session.wait(inDashboard.runId)).toMatchObject({ status: "ok" });
+      const dashboardOutput = lastExec(gateway);
+      expect(await status(profileId)).toEqual({
+        creatorProfileId: profileId,
+        entryNames: [PLAIN, SECRET],
+      });
+      expect(line(dashboardOutput, "secret-env")).toMatch(/^oc-sent-v2\./);
+      expect(line(dashboardOutput, "plain")).toBe(`present:${plainHash}`);
+      expect(
+        origins.received.map(({ host, path: requestPath, authorization }) => [
+          host,
+          requestPath,
+          authorization,
+        ]),
+      ).toEqual([
+        [ALLOWED_HOST, "/allowed", "Bearer"],
+        [DENIED_HOST, "/denied", "Bearer"],
+        [DENIED_HOST, "/control", undefined],
+        [ALLOWED_HOST, "/allowed", `Bearer ${secretValue}`],
+        [DENIED_HOST, "/control", undefined],
+      ]);
+      await expectNoLeak();
     }),
 );
 

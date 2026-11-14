@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { GATEWAY_OWNER_PROFILE_ID } from "../../packages/gateway-protocol/src/schema/user-profile-constants.js";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../config/runtime-snapshot.js";
 import { resolveSessionStorePathCore } from "../config/sessions/paths.js";
 import {
   assignSessionOwner,
@@ -123,6 +127,8 @@ const target = (sessionKey = SESSION) => ({ storeScope: store, agentId: AGENT, s
 const vault = new Map<string, readonly SessionSecretEntry[]>();
 /** Alice's entries from now on. */
 const entries = (...list: SessionSecretEntry[]) => vault.set(people.alice, list);
+/** Every provider call, names and values alike. */
+let providerCalls: string[];
 const authority = (profileId: string) =>
   createAdmittedRunOperatorAuthority({ profileId, scopes: [], assertCurrent: () => {} });
 
@@ -273,9 +279,16 @@ beforeEach(() => {
     });
   }
   vault.clear();
+  providerCalls = [];
   setSessionSecretValueProviderForTest({
-    listNames: (profileId) => (vault.get(profileId) ?? []).map((entry) => entry.name),
-    readEntries: (profileId) => vault.get(profileId) ?? [],
+    listNames: (profileId) => {
+      providerCalls.push(`listNames:${profileId}`);
+      return (vault.get(profileId) ?? []).map((entry) => entry.name);
+    },
+    readEntries: (profileId) => {
+      providerCalls.push(`readEntries:${profileId}`);
+      return vault.get(profileId) ?? [];
+    },
   });
   entries({ name: KEY, kind: "env", value });
   mocks.spawnInputs.length = 0;
@@ -489,6 +502,85 @@ describe("the creator's vault is the switch", () => {
     const { env, surfaces } = await launch(turn("bob"), { sessionSecrets: { target: alias } });
     expect(env[KEY]).toBe(value);
     expectNoLeak(surfaces);
+  });
+});
+
+describe("sessions channel traffic can reach use no one's secrets", () => {
+  afterEach(() => clearRuntimeConfigSnapshot());
+
+  const sandbox = {
+    containerName: "sandbox",
+    workspaceDir: "/workspace",
+    containerWorkdir: "/workspace",
+    buildExecSpec: async ({ env }: { env: Record<string, string> }) => ({
+      argv: ["sh", "-c", "echo ok"],
+      env,
+      stdinMode: "pipe-closed" as const,
+    }),
+  };
+
+  it.each<[string, string, { mainKey?: string } | undefined, boolean]>([
+    // Alice sent the first message in each of these; DMs or groups can still land there.
+    ["the agent's main session", "agent:main:main", undefined, false],
+    ["the main session under a custom mainKey", "agent:main:work", { mainKey: "work" }, false],
+    // The upstream main alias stays the main session when mainKey changes.
+    ["the main alias under a custom mainKey", "agent:main:main", { mainKey: "work" }, false],
+    // Slack Assistant DM threads and Telegram DM topics thread under the main session.
+    [
+      "a thread under the main session",
+      "agent:main:work:thread:1700000000.000100",
+      { mainKey: "work" },
+      false,
+    ],
+    ["a per-peer DM", "agent:main:direct:+15550001", undefined, false],
+    ["a per-channel-peer DM", "agent:main:whatsapp:direct:+15550001", undefined, false],
+    ["a per-account DM", "agent:main:telegram:default:direct:12345", undefined, false],
+    ["a group", "agent:main:whatsapp:group:120363@g.us", undefined, false],
+    ["a bound thread", "agent:main:slack:channel:c0123:thread:1700000000.000100", undefined, false],
+    // Controls: ordinary sessions still deliver, and only the configured main key is main.
+    ["Alice's dashboard session", "agent:main:dashboard:control", undefined, true],
+    ["a session named like a custom mainKey", "agent:main:work", undefined, true],
+    [
+      "the dashboard under a custom mainKey",
+      "agent:main:dashboard:control",
+      { mainKey: "work" },
+      true,
+    ],
+  ])("%s", async (_label, sessionKey, session, delivers) => {
+    if (session) {
+      setRuntimeConfigSnapshot({ session });
+    }
+    await writeSession(sessionKey, { createdActor: ALICE });
+    const results = [];
+    for (const person of ["alice", "bob", undefined] as const) {
+      results.push(await launchIn(sessionKey, person));
+    }
+    // Unsupported launches stay silent there too: nothing was withheld.
+    const sandboxed = await launch(turn("alice"), {
+      sessionKey,
+      sessionSecrets: { target: target(sessionKey) },
+      sandbox,
+    } as never);
+    const status = await readSessionSecretsStatus(target(sessionKey), people.alice);
+
+    expect(results.map(({ env }) => env[KEY])).toEqual(
+      results.map(() => (delivers ? value : undefined)),
+    );
+    expect(results.flatMap(({ warnings }) => warnings)).toEqual([]);
+    expect(sandboxed.warnings).toEqual(
+      delivers
+        ? [`Session secrets were not provided to this command: sandbox exec is not supported.`]
+        : [],
+    );
+    expect(status?.creatorProfileId).toBe(delivers ? people.alice : undefined);
+    if (!delivers) {
+      // Refused before anything is read, as for a creator without entries.
+      expect(providerCalls).toEqual([]);
+    }
+    expectNoLeak({
+      ...Object.fromEntries(results.map(({ surfaces }, index) => [index, surfaces])),
+      status,
+    });
   });
 });
 

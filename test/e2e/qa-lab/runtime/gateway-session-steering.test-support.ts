@@ -384,9 +384,8 @@ function createSteeringApi(params: {
   const heldTurns: Array<ReturnType<typeof heldReply>> = [];
   const sentMessages = new Set<string>();
 
-  /** One conversation per scenario. */
-  const session = () => {
-    const sessionKey = `agent:${agentId}:dashboard:${randomUUID()}`;
+  /** One conversation per scenario; a fresh dashboard session unless a key is given. */
+  const session = (sessionKey = `agent:${agentId}:dashboard:${randomUUID()}`) => {
     // A conversation's requests carry at least one message it sent, even after compaction
     // summarizes older ones, which attributes concurrent conversations without arrival order.
     const sent: string[] = [];

@@ -6,10 +6,13 @@
  * storing entries is the opt-in and deleting them the opt-out. Each launch resolves the
  * creator from the session entry and reads the entries once; nothing is kept in between.
  * `secret` entries reach commands only as sentinels that the egress proxy resolves for
- * their allowed hosts; `env` entries are plaintext.
+ * their allowed hosts; `env` entries are plaintext. Sessions that inbound channel traffic
+ * can reach get none.
  */
 import { GATEWAY_OWNER_PROFILE_ID } from "../../packages/gateway-protocol/src/schema/user-profile-constants.js";
 import { getRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
+import { resolveCanonicalMainSessionKey } from "../config/sessions/main-session-key.js";
+import { canonicalizeMainSessionAlias } from "../config/sessions/main-session.js";
 import { sessionCreatorProfileId } from "../config/sessions/session-entry-provenance.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -30,11 +33,13 @@ import { ENV_SECRET_REF_ID_RE } from "../secrets/ref-contract.js";
 import { sealSecretSentinel } from "../secrets/sentinel.js";
 import { SECRET_STORE_VALUE_MAX_BYTES } from "../secrets/store/secret-store-validation-error.js";
 import { normalizeSecretAllowedHosts } from "../secrets/store/secret-store-validation.js";
+import { deriveSessionChatTypeFromKey } from "../sessions/session-chat-type-shared.js";
 import { getCurrentSessionControllerOwner } from "../sessions/session-controller.context.js";
 import {
   getSessionControllerEntryForOperation,
   isCurrentSessionControllerOperation,
 } from "../sessions/session-controller.identity.js";
+import { parseThreadSessionSuffix } from "../sessions/session-key-utils.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { readResidentUserProfileIdentity } from "../state/user-profile-list.js";
 import { getInProcessGatewayToolContext } from "./tools/in-process-gateway.js";
@@ -114,6 +119,33 @@ export function resolveSessionSecretsCreator(
     : undefined;
 }
 
+/**
+ * Sessions that inbound channel traffic can reach, by key, never use anyone's secrets,
+ * whoever created them: the agent's main session under the configured `session.mainKey`
+ * and scope (DMs with dmScope "main", groups with groupScope "main", or every message
+ * under the global scope) and threads under it (Slack assistant DM threads, Telegram DM
+ * topics), and every channel-peer key (DM, group or channel, threads included). Keys never
+ * change, so the rule cannot drift with routing state. Conversation bindings, which can
+ * point a channel at any key, are not covered.
+ */
+function isChannelRoutedSession(cfg: OpenClawConfig, target: SessionSecretsTarget): boolean {
+  const agentId = agentOf(target);
+  const sessionKey = canonicalizeSessionKeyForAgent(agentId, target.sessionKey.trim());
+  const base = canonicalizeMainSessionAlias({
+    cfg,
+    agentId,
+    sessionKey: parseThreadSessionSuffix(sessionKey).baseSessionKey ?? sessionKey,
+  });
+  return (
+    base ===
+      resolveCanonicalMainSessionKey({
+        agentId,
+        mainKey: cfg.session?.mainKey,
+        sessionScope: cfg.session?.scope,
+      }) || deriveSessionChatTypeFromKey(sessionKey) !== "unknown"
+  );
+}
+
 async function readSessionEntry(target: SessionSecretsTarget) {
   const { loadSessionEntry } = await import("../config/sessions/session-accessor.js");
   // The accessor canonicalizes agent-relative aliases itself.
@@ -138,6 +170,9 @@ export async function readSessionSecretsStatus(
     return undefined;
   }
   const cfg = currentConfig();
+  if (isChannelRoutedSession(cfg, target)) {
+    return undefined;
+  }
   const agentId = agentOf(target);
   const sessionKey = canonicalizeSessionKeyForAgent(agentId, target.sessionKey.trim());
   const facts = await prepareSessionMutationFacts({ cfg, agentId, sessionKey }).catch(
@@ -262,9 +297,11 @@ export async function resolveSessionSecretsLaunch(
     return undefined;
   }
   const provider = state.provider;
-  const creatorProfileId = provider
-    ? resolveSessionSecretsCreator(await readSessionEntry(target))
-    : undefined;
+  // Checked before anything is read: like a creator without entries, silently nothing.
+  const creatorProfileId =
+    provider && !isChannelRoutedSession(currentConfig(), target)
+      ? resolveSessionSecretsCreator(await readSessionEntry(target))
+      : undefined;
   if (!provider || !creatorProfileId) {
     return undefined;
   }
