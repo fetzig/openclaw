@@ -315,9 +315,10 @@ export function setSessionSecretValueProviderForTest(
  * Mirrors the team store: names match its pattern and values its 64 KiB limit, and
  * plaintext `env` entries pass the host-env denylist. `secret` entries are sentinels, not
  * live credentials, so credential names such as GH_TOKEN stay usable; unlike the team
- * store, they may not take names that change how commands run (PATH, HOME, loader and
- * tool-configuration overrides such as NODE_OPTIONS or LD_PRELOAD), where a sentinel
- * would break or redirect every command in the creator's sessions.
+ * store, they may not take names that change how commands run (PATH, HOME, OpenClaw's own
+ * OPENCLAW_* variables, loader and tool-configuration overrides such as NODE_OPTIONS or
+ * LD_PRELOAD), where a sentinel would break or redirect every command in the creator's
+ * sessions.
  */
 function rejectionReason(name: string, value: string, kind: "secret" | "env"): string | undefined {
   if (!ENV_SECRET_REF_ID_RE.test(name)) {
@@ -327,14 +328,13 @@ function rejectionReason(name: string, value: string, kind: "secret" | "env"): s
   const changesHowCommandsRun =
     upper === "PATH" ||
     upper === "HOME" ||
+    // OpenClaw's own variables, such as the OPENCLAW_SHELL marker, which a grant would override.
+    upper.startsWith("OPENCLAW_") ||
     isDangerousHostEnvVarName(name) ||
     (isDangerousHostEnvOverrideVarName(name) && (kind === "env" || !isSensitiveEnvName(name)));
   if (
     changesHowCommandsRun ||
-    (kind === "env" &&
-      (OPENCLAW_OWNED_NAMES.has(upper) ||
-        upper.startsWith("OPENCLAW_") ||
-        isGatewayCredentialEnvVarName(name)))
+    (kind === "env" && (OPENCLAW_OWNED_NAMES.has(upper) || isGatewayCredentialEnvVarName(name)))
   ) {
     return "reserved name";
   }

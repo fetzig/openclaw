@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GATEWAY_OWNER_PROFILE_ID } from "../../packages/gateway-protocol/src/schema/user-profile-constants.js";
 import {
   clearRuntimeConfigSnapshot,
@@ -11,47 +11,52 @@ import {
   loadSessionEntry,
   replaceSessionEntry,
 } from "../config/sessions/session-accessor.js";
-import { addSessionMember } from "../config/sessions/session-sharing-store.native.js";
 import type { SessionEntry } from "../config/sessions/types.js";
+import type { SessionBindingRecord } from "../infra/outbound/session-binding-service.js";
 import { isSecretValueRegisteredForRedaction } from "../logging/secret-redaction-registry.js";
 import type { SpawnInput } from "../process/supervisor/types.js";
-import type { SecretEgressSentinelBinding } from "../secrets/egress-proxy/proxy-server.js";
-import {
-  clearSecretEgressProxy,
-  publishSecretEgressProxy,
-} from "../secrets/egress-proxy/registry.js";
 import {
   looksLikeSecretSentinel,
   resolveSecretSentinel,
   sealSecretSentinel,
 } from "../secrets/sentinel.js";
-import { withSessionTurn } from "../sessions/session-controller.admission.js";
-import { prepareUserProfileCatalog } from "../state/user-profile-list.js";
-import { mergeProfiles } from "../state/user-profile-writes.worker.js";
-import { ensureGatewayOwnerProfile, ensureProfileForEmail } from "../state/user-profiles.js";
-import {
-  createOpenClawTestState,
-  type OpenClawTestState,
-} from "../test-utils/openclaw-test-state.js";
 import { INTERNAL_MESSAGE_CHANNEL } from "../utils/message-channel-constants.js";
-import { createAdmittedRunOperatorAuthority } from "./admitted-run-context.js";
-import { resetProcessRegistryForTests } from "./bash-process-registry.test-support.js";
 import type { CapturedEnvironment } from "./bash-tools.exec-env.test-support.js";
-import { runExecFixture } from "./bash-tools.exec-fixture.test-support.js";
 import { runtimeManagedRun } from "./bash-tools.exec-runtime.test-support.js";
-import type { ExecToolDefaults } from "./bash-tools.exec-types.js";
 import {
+  activateProxy,
+  addMember,
+  AGENT,
+  ALICE,
+  aliceSession,
+  entries,
+  execToolInTurn,
+  expectNoLeak,
+  human,
   installBindingOwner,
+  installSessionSecretsHarness,
+  KEY,
+  launch,
+  launchIn,
+  logs,
+  OTHER_STORE,
+  people,
+  probe,
+  providerCalls,
+  registered,
+  revoked,
   sandboxBackend as sandbox,
+  SESSION,
+  SESSION_ID,
+  store,
+  target,
+  turn,
+  value,
+  vault,
+  writeSession,
 } from "./bash-tools.exec.session-secrets.test-support.js";
 import { createOperationalRunInstanceRef } from "./operational-run-instance.js";
-import {
-  readSessionSecretsStatus,
-  setSessionSecretValueProviderForTest,
-  type SessionSecretEntry,
-} from "./session-secrets.js";
-import type { ExtensionContext } from "./sessions/index.js";
-import { withGatewayToolCallerIdentity } from "./tools/gateway-caller-context.js";
+import { readSessionSecretsStatus } from "./session-secrets.js";
 
 const mocks = vi.hoisted(() => ({
   hookRunner: undefined as
@@ -67,6 +72,7 @@ const mocks = vi.hoisted(() => ({
   durableInputs: [] as Array<{ env?: Record<string, string> }>,
   /** PTY construction fails before launch, so runExecProcess retries without a PTY. */
   failPty: false,
+  storeBindings: new Map<string, SessionBindingRecord[]>(),
 }));
 
 // mock-isolation: Each test installs its own plugin hooks instead of the global registry.
@@ -83,11 +89,12 @@ vi.mock("./bash-tools.exec-host-gateway.js", async () =>
   (await import("./bash-tools.exec-env.test-support.js")).gatewayEnvironmentMock(mocks),
 );
 // mock-isolation: The generic binding store runs on the Gateway's state-worker broker, which
-// vitest worker threads lack; registered binding owners stay real, and the E2E covers the store.
+// vitest worker threads lack; tests stage its records per session key, registered binding
+// owners stay real, and the E2E covers the store itself.
 vi.mock("../infra/outbound/current-conversation-bindings.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../infra/outbound/current-conversation-bindings.js")>()),
   listGenericCurrentConversationBindingsBySessionsAsync: async (keys: readonly string[]) =>
-    keys.map(() => []),
+    keys.map((key) => mocks.storeBindings.get(key) ?? []),
 }));
 // mock-isolation: Durable launches are captured instead of reaching systemd.
 vi.mock("./bash-process-durable.js", () => ({
@@ -117,225 +124,7 @@ vi.mock("../process/supervisor/index.js", () => ({
   }),
 }));
 
-let createExecTool: typeof import("./bash-tools.exec-run.js").createExecTool;
-let toToolDefinitions: typeof import("./agent-tool-definition-adapter.js").toToolDefinitions;
-
-const AGENT = "main";
-const SESSION = "agent:main:dashboard:vault";
-const SESSION_ID = "vault-session";
-const OTHER_STORE = "/synthetic/session-secrets/other-sessions";
-const KEY = "VAULT_TEST_TOKEN";
-/** Verified Gateway profiles, created in beforeAll; Alice's old profile was merged into hers. */
-const people = { alice: "", aliceOld: "", bob: "", carol: "" };
-const human = (id: string) => ({ type: "human", source: "profile", id }) as const;
-let ALICE: ReturnType<typeof human>;
-let state: OpenClawTestState;
-let releaseProfileCatalog: (() => void) | undefined;
-let store: string;
-let value: string;
-let logs: string[];
-/** Bindings each launch registered with the egress proxy, when one is active. */
-let registered: SecretEgressSentinelBinding[][];
-/** Indexes into `registered` whose grant was revoked. */
-let revoked: number[];
-let proxy:
-  | { registerProcess: (bindings?: readonly SecretEgressSentinelBinding[]) => unknown }
-  | undefined;
-
-const target = (sessionKey = SESSION) => ({ storeScope: store, agentId: AGENT, sessionKey });
-/** The synthetic vault: each profile's current entries, changed between launches by tests. */
-const vault = new Map<string, readonly SessionSecretEntry[]>();
-/** Alice's entries from now on. */
-const entries = (...list: SessionSecretEntry[]) => vault.set(people.alice, list);
-/** Every provider call, names and values alike. */
-let providerCalls: string[];
-const authority = (profileId: string) =>
-  createAdmittedRunOperatorAuthority({ profileId, scopes: [], assertCurrent: () => {} });
-
-/** One admitted turn; `profileId` is whoever prompted it. */
-const turn = (person: keyof typeof people | undefined, agentId = AGENT) => ({
-  agentId,
-  sessionKey: SESSION,
-  operationalRunInstance: createOperationalRunInstanceRef(`run-${randomUUID()}`),
-  ...(person ? { operatorAuthority: authority(people[person]) } : {}),
-});
-
-/** A Gateway egress proxy stand-in that records each launch's bindings. */
-function activateProxy() {
-  proxy = {
-    registerProcess: (bindings = []) => {
-      const index = registered.push([...bindings]) - 1;
-      return {
-        env: { HTTPS_PROXY: "http://openclaw:token@127.0.0.1:9" },
-        revoke: () => void revoked.push(index),
-      };
-    },
-  };
-  publishSecretEgressProxy(proxy as never);
-}
-
-/** Launches one command through runExecProcess as the given turn; returns every observable surface. */
-async function launch(
-  caller: ReturnType<typeof turn>,
-  overrides: Parameters<typeof runExecFixture>[0] = {},
-) {
-  const warnings: string[] = [];
-  const transportEnvs: unknown[] = [];
-  const before = mocks.spawnInputs.length + mocks.durableInputs.length;
-  const run = await withGatewayToolCallerIdentity(caller, () =>
-    runExecFixture({
-      env: { BASE: "1" },
-      warnings,
-      sessionKey: SESSION,
-      sessionId: SESSION_ID,
-      agentId: caller.agentId,
-      sessionSecrets: {
-        target: { storeScope: store, agentId: caller.agentId, sessionKey: SESSION },
-      },
-      approvalTransport: {
-        assertExecution: (request: unknown) => transportEnvs.push(request),
-      } as never,
-      ...overrides,
-    }),
-  );
-  const outcome = await run.promise;
-  const spawned = [...mocks.spawnInputs, ...mocks.durableInputs].slice(before);
-  return {
-    env: spawned.at(-1)?.env ?? {},
-    warnings,
-    surfaces: {
-      warnings,
-      outcome,
-      session: { command: run.session.command, aggregated: run.session.aggregated },
-      approvalTransport: transportEnvs,
-      logs,
-    },
-  };
-}
-
-/** The value may appear only in the spawned process env, never in any other channel. */
-function expectNoLeak(surfaces: Record<string, unknown>) {
-  for (const [name, surface] of Object.entries(surfaces)) {
-    expect(JSON.stringify(surface) ?? "", `${name} leaked the value`).not.toContain(value);
-  }
-}
-
-/** Runs the exec tool inside a session turn of the given store, as an agent turn does. */
-async function execToolInTurn(
-  caller: ReturnType<typeof turn>,
-  params: Record<string, unknown>,
-  options: { storeScope?: string; defaults?: ExecToolDefaults } = {},
-) {
-  const tool = createExecTool({
-    host: "gateway",
-    security: "full",
-    ask: "off",
-    sessionId: SESSION_ID,
-    ...options.defaults,
-  });
-  const [definition] = toToolDefinitions([tool], { agentId: AGENT, sessionKey: SESSION });
-  return await withSessionTurn(
-    {
-      sessionKey: SESSION,
-      sessionId: SESSION_ID,
-      agentId: AGENT,
-      storePath: options.storeScope ?? store,
-    },
-    () =>
-      withGatewayToolCallerIdentity(caller, () =>
-        definition!.execute(
-          `call-${randomUUID()}`,
-          { yieldMs: 120_000, ...params },
-          undefined,
-          undefined,
-          {} as ExtensionContext,
-        ),
-      ),
-  );
-}
-
-async function writeSession(sessionKey: string, fields: Partial<SessionEntry>) {
-  await replaceSessionEntry(
-    { agentId: AGENT, sessionKey, storePath: store },
-    { sessionId: SESSION_ID, updatedAt: Date.now(), ...fields },
-  );
-}
-
-beforeAll(async () => {
-  state = await createOpenClawTestState({
-    prefix: "openclaw-session-secrets-",
-    layout: "state-only",
-    env: { OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" },
-  });
-  store = resolveSessionStorePathCore(undefined, { agentId: AGENT });
-  for (const name of Object.keys(people) as Array<keyof typeof people>) {
-    people[name] = ensureProfileForEmail(`${name}@example.test`).id;
-  }
-  // Alice signed in under a second profile that an admin merged with her first one.
-  mergeProfiles(people.aliceOld, people.alice);
-  ALICE = human(people.alice);
-  await writeSession(SESSION, { createdActor: ALICE });
-  ensureGatewayOwnerProfile(null);
-  // The Gateway prepares the profile catalog at admission; sharing checks read it.
-  releaseProfileCatalog = (await prepareUserProfileCatalog()).release;
-  ({ createExecTool } = await import("./bash-tools.exec-run.js"));
-  ({ toToolDefinitions } = await import("./agent-tool-definition-adapter.js"));
-});
-
-afterAll(async () => {
-  releaseProfileCatalog?.();
-  await state?.cleanup();
-});
-
-beforeEach(() => {
-  value = `vt-${randomUUID()}`;
-  logs = [];
-  registered = [];
-  revoked = [];
-  mocks.failPty = false;
-  for (const method of ["log", "info", "warn", "error", "debug"] as const) {
-    vi.spyOn(console, method).mockImplementation((...args) => void logs.push(args.join(" ")));
-  }
-  for (const stream of [process.stdout, process.stderr]) {
-    const write = stream.write.bind(stream);
-    vi.spyOn(stream, "write").mockImplementation((chunk, ...rest) => {
-      logs.push(String(chunk));
-      return write(chunk, ...(rest as []));
-    });
-  }
-  vault.clear();
-  providerCalls = [];
-  setSessionSecretValueProviderForTest({
-    listNames: (profileId) => {
-      providerCalls.push(`listNames:${profileId}`);
-      return (vault.get(profileId) ?? []).map(({ name, kind = "secret", allowedHosts }) => ({
-        name,
-        kind,
-        allowedHosts,
-      }));
-    },
-    readEntries: (profileId) => {
-      providerCalls.push(`readEntries:${profileId}`);
-      return vault.get(profileId) ?? [];
-    },
-  });
-  entries({ name: KEY, kind: "env", value });
-  mocks.spawnInputs.length = 0;
-  mocks.durableInputs.length = 0;
-  mocks.gatewayParams.length = 0;
-  mocks.hookRunner = undefined;
-});
-
-afterEach(async () => {
-  if (proxy) {
-    clearSecretEgressProxy(proxy as never);
-    proxy = undefined;
-  }
-  vi.useRealTimers();
-  vi.restoreAllMocks();
-  resetProcessRegistryForTests();
-  setSessionSecretValueProviderForTest(undefined);
-});
+installSessionSecretsHarness(mocks);
 
 describe("whose secrets a session uses", () => {
   type Name = "alice" | "bob";
@@ -442,33 +231,6 @@ describe("whose secrets a session uses", () => {
   });
 });
 
-/** A fresh session of Alice's with the given fields; returns its key. */
-async function aliceSession(fields: Partial<SessionEntry> = {}) {
-  const sessionKey = `agent:main:dashboard:alice-${randomUUID()}`;
-  await writeSession(sessionKey, { createdActor: ALICE, ...fields });
-  return sessionKey;
-}
-const launchIn = (sessionKey: string, person: keyof typeof people | undefined) =>
-  launch(turn(person), { sessionKey, sessionSecrets: { target: target(sessionKey) } });
-/** Launches by Alice, Bob and no person, and the status Alice sees. */
-async function probe(sessionKey: string) {
-  const results = [];
-  for (const person of ["alice", "bob", undefined] as const) {
-    results.push(await launchIn(sessionKey, person));
-  }
-  return {
-    values: results.map(({ env }) => env[KEY]),
-    warnings: results.flatMap(({ warnings }) => warnings),
-    status: await readSessionSecretsStatus(target(sessionKey), people.alice),
-    surfaces: Object.fromEntries(results.map(({ surfaces }, index) => [index, surfaces])),
-  };
-}
-const addMember = (sessionKey: string, person: keyof typeof people) =>
-  addSessionMember(
-    { agentId: AGENT, sessionKey, storePath: store },
-    { identityId: people[person], addedBy: people.alice },
-  );
-
 describe("the creator's vault is the switch", () => {
   it("each launch reads the creator's current entries", async () => {
     const stored = await launchIn(SESSION, "bob");
@@ -552,7 +314,8 @@ describe("sessions channel traffic can reach use no one's secrets", () => {
 
   const MAIN = "main-session";
   const CHANNEL = "channel-session";
-  it.each<[string, string, { mainKey?: string } | undefined, string | undefined]>([
+  type Session = { mainKey?: string; scope?: "global" };
+  it.each<[string, string, Session | undefined, string | undefined]>([
     // Alice sent the first message in each of these; DMs or groups can still land there.
     ["the agent's main session", "agent:main:main", undefined, MAIN],
     // Own agents: one store with both main rows needs a doctor migration under mainKey "work".
@@ -566,6 +329,8 @@ describe("sessions channel traffic can reach use no one's secrets", () => {
       { mainKey: "work" },
       MAIN,
     ],
+    // Under the global scope every inbound message lands in the one `global` session.
+    ["the global session", "global", { scope: "global" }, MAIN],
     ["a per-peer DM", "agent:main:direct:+15550001", undefined, CHANNEL],
     ["a per-channel-peer DM", "agent:main:whatsapp:direct:+15550001", undefined, CHANNEL],
     ["a per-account DM", "agent:main:telegram:default:direct:12345", undefined, CHANNEL],
@@ -590,7 +355,8 @@ describe("sessions channel traffic can reach use no one's secrets", () => {
     if (session) {
       setRuntimeConfigSnapshot({ session });
     }
-    const agentId = sessionKey.split(":")[1]!;
+    // `global` names no agent; it lives in its own agent's store here.
+    const agentId = sessionKey.split(":")[1] ?? "scoped";
     const where = {
       storeScope: resolveSessionStorePathCore(undefined, { agentId }),
       agentId,
@@ -635,104 +401,6 @@ describe("sessions channel traffic can reach use no one's secrets", () => {
       ...Object.fromEntries(results.map(({ surfaces }, index) => [index, surfaces])),
       status,
     });
-  });
-});
-
-describe("spawned sessions use what their parent session uses", () => {
-  /** A sub-agent spawned in `parent` by Bob's turn: upstream attributes it to Bob. */
-  async function spawnIn(parent: string, store_ = store, agentId = AGENT) {
-    const sessionKey = `agent:${agentId}:subagent:${randomUUID()}`;
-    await replaceSessionEntry(
-      { agentId, sessionKey, storePath: store_ },
-      {
-        sessionId: SESSION_ID,
-        updatedAt: Date.now(),
-        createdActor: { type: "agent", id: agentId, delegatedBy: human(people.bob) },
-        spawnedBy: parent,
-        parentSessionKey: parent,
-      },
-    );
-    return sessionKey;
-  }
-
-  beforeEach(() => {
-    // Bob has entries too: a child that used its own creator would get his.
-    vault.set(people.bob, [{ name: KEY, kind: "env", value: `bob-${value}` }]);
-  });
-
-  it("a sub-agent and its sub-agent spawned by Bob's turns in Alice's session use hers", async () => {
-    const aliceKey = await aliceSession({ visibility: "shared" });
-    const child = await spawnIn(aliceKey);
-    const grandchild = await spawnIn(child);
-    const results = { child: await probe(child), grandchild: await probe(grandchild) };
-
-    for (const result of Object.values(results)) {
-      expect(result.values).toEqual([value, value, value]);
-      expect(result.status).toEqual({ creatorProfileId: people.alice, entryNames: [KEY] });
-      expect(result.warnings).toEqual([]);
-      expectNoLeak(result.surfaces);
-    }
-  });
-
-  it("a sub-agent in another agent reads its parent from that agent's store", async () => {
-    // The child runs as agent "coder"; its parent is Alice's session of agent "main".
-    const aliceKey = await aliceSession();
-    const coderStore = resolveSessionStorePathCore(undefined, { agentId: "coder" });
-    const child = await spawnIn(aliceKey, coderStore, "coder");
-    const coderTarget = { storeScope: coderStore, agentId: "coder", sessionKey: child };
-    const { env, surfaces } = await launch(turn("bob", "coder"), {
-      sessionKey: child,
-      sessionSecrets: { target: coderTarget },
-    });
-    expect(env[KEY]).toBe(value);
-    expectNoLeak(surfaces);
-  });
-
-  it.each<[string, string, string]>([
-    ["the main session", "agent:main:main", "main-session"],
-    ["a channel DM", "agent:main:whatsapp:direct:+15550001", "channel-session"],
-  ])("children of %s get nothing, and status says why", async (_label, parent, reason) => {
-    // Alice created the parent herself; only its key excludes it.
-    await writeSession(parent, { createdActor: ALICE });
-    const child = await spawnIn(parent);
-    const grandchild = await spawnIn(child);
-    const parentStatus = await readSessionSecretsStatus(target(parent), people.alice);
-    const results = { child: await probe(child), grandchild: await probe(grandchild) };
-    const sandboxed = await launch(turn("alice"), {
-      sessionKey: child,
-      sessionSecrets: { target: target(child) },
-      sandbox,
-    } as never);
-
-    expect(parentStatus).toEqual({ excluded: reason });
-    for (const result of Object.values(results)) {
-      expect(result.values).toEqual([undefined, undefined, undefined]);
-      expect(result.status).toEqual({ excluded: "inherited", from: parent });
-      expectNoLeak(result.surfaces);
-    }
-    // No notice on exec, sandboxed or not, and nothing was read.
-    expect([...results.child.warnings, ...results.grandchild.warnings]).toEqual([]);
-    expect(sandboxed.warnings).toEqual([]);
-    expect(providerCalls).toEqual([]);
-  });
-
-  it("an unreadable parent, a cycle or a parent without a person give nothing", async () => {
-    const deleted = await spawnIn(`agent:main:dashboard:deleted-${randomUUID()}`);
-    // The parent's agent has no such session in its store.
-    const elsewhere = await spawnIn(`agent:coder:dashboard:${randomUUID()}`);
-    const loopA = `agent:main:subagent:${randomUUID()}`;
-    const loopB = await spawnIn(loopA);
-    await writeSession(loopA, { createdActor: ALICE, spawnedBy: loopB });
-    const agentParent = `agent:main:dashboard:${randomUUID()}`;
-    await writeSession(agentParent, { createdActor: { type: "agent", id: "main" } });
-    const orphan = await spawnIn(agentParent);
-
-    for (const sessionKey of [deleted, elsewhere, loopA, loopB, orphan]) {
-      const result = await probe(sessionKey);
-      expect(result.values, sessionKey).toEqual([undefined, undefined, undefined]);
-      expect(result.status, sessionKey).toBeUndefined();
-      expect(result.warnings, sessionKey).toEqual([]);
-    }
   });
 });
 
@@ -819,6 +487,31 @@ describe("sessions bound to a channel conversation use no one's secrets", () => 
     expect([...bound.warnings, ...sandboxed.warnings]).toEqual([]);
     expect(bound.status).toBeUndefined();
     expect(providerCalls).toEqual([]);
+    expectNoLeak(bound.surfaces);
+  });
+
+  it("an external binding in the binding store stops delivery before the vault is read", async () => {
+    const sessionKey = await aliceSession();
+    // What the generic current-conversation store holds for a channel bound without an owner.
+    mocks.storeBindings.set(sessionKey, [
+      {
+        bindingId: `generic:${randomUUID()}`,
+        targetSessionKey: sessionKey,
+        targetKind: "session",
+        status: "active",
+        boundAt: Date.now(),
+        conversation: { channel: "telegram", accountId: "default", conversationId: "-100123" },
+      },
+    ]);
+    const bound = await probe(sessionKey);
+    const callsWhileBound = [...providerCalls];
+    const control = await probe(await aliceSession());
+
+    expect(bound.values).toEqual([undefined, undefined, undefined]);
+    expect(bound.status).toBeUndefined();
+    expect(bound.warnings).toEqual([]);
+    expect(callsWhileBound).toEqual([]);
+    expect(control.values).toEqual([value, value, value]);
     expectNoLeak(bound.surfaces);
   });
 
@@ -1094,6 +787,9 @@ describe("session secrets at launch", () => {
       "LD_PRELOAD",
       "GIT_SSH_COMMAND",
       "HTTPS_PROXY",
+      // OpenClaw sets these itself; a grant would override them.
+      "OPENCLAW_SHELL",
+      "OPENCLAW_GATEWAY_TOKEN",
     ];
     entries(
       ...[...allowed, ...refused].map((name) => ({
@@ -1111,6 +807,8 @@ describe("session secrets at launch", () => {
     for (const name of refused) {
       expect(looksLikeSecretSentinel(env[name] ?? ""), name).toBe(false);
     }
+    // OpenClaw's own marker survives: grant env would otherwise win the merge.
+    expect(env.OPENCLAW_SHELL).toBe("exec");
     expect(registered[0]!.map((binding) => binding.name).toSorted()).toEqual(allowed.toSorted());
     expect(warnings).toEqual([
       `Warning: session secret entries were not provided: ${refused
