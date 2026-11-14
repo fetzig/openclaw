@@ -30,6 +30,7 @@ import { normalizeAgentId } from "../routing/session-key.js";
 import type { SecretEgressSentinelBinding } from "../secrets/egress-proxy/proxy-server.js";
 import { isSecretEgressProxyActive } from "../secrets/egress-proxy/registry.js";
 import { ENV_SECRET_REF_ID_RE } from "../secrets/ref-contract.js";
+import { isSensitiveEnvName } from "../secrets/secret-env-name.js";
 import { sealSecretSentinel } from "../secrets/sentinel.js";
 import { SECRET_STORE_VALUE_MAX_BYTES } from "../secrets/store/secret-store-validation-error.js";
 import { normalizeSecretAllowedHosts } from "../secrets/store/secret-store-validation.js";
@@ -122,11 +123,8 @@ export function resolveSessionSecretsCreator(
 ): string | undefined {
   const creatorId = sessionCreatorProfileId(entry?.createdActor);
   const profileId = creatorId ? readResidentUserProfileIdentity(creatorId)?.profileId : undefined;
-  return profileId &&
-    creatorId !== GATEWAY_OWNER_PROFILE_ID &&
-    profileId !== GATEWAY_OWNER_PROFILE_ID
-    ? profileId
-    : undefined;
+  // Checked after canonicalization, so a profile merged into the owner's is refused too.
+  return profileId !== GATEWAY_OWNER_PROFILE_ID ? profileId : undefined;
 }
 
 /**
@@ -243,22 +241,29 @@ export function setSessionSecretValueProviderForTest(
 }
 
 /**
- * Mirrors the team store: names match its pattern and values its 64 KiB limit; plaintext
- * `env` entries also pass the host-env denylist, while `secret` entries are sentinels, not
- * live credentials, so names such as GH_TOKEN stay usable.
+ * Mirrors the team store: names match its pattern and values its 64 KiB limit, and
+ * plaintext `env` entries pass the host-env denylist. `secret` entries are sentinels, not
+ * live credentials, so credential names such as GH_TOKEN stay usable; unlike the team
+ * store, they may not take names that change how commands run (PATH, HOME, loader and
+ * tool-configuration overrides such as NODE_OPTIONS or LD_PRELOAD), where a sentinel
+ * would break or redirect every command in the creator's sessions.
  */
 function rejectionReason(name: string, value: string, kind: "secret" | "env"): string | undefined {
   if (!ENV_SECRET_REF_ID_RE.test(name)) {
     return "invalid name";
   }
   const upper = name.toUpperCase();
+  const changesHowCommandsRun =
+    upper === "PATH" ||
+    upper === "HOME" ||
+    isDangerousHostEnvVarName(name) ||
+    (isDangerousHostEnvOverrideVarName(name) && (kind === "env" || !isSensitiveEnvName(name)));
   if (
-    kind === "env" &&
-    (OPENCLAW_OWNED_NAMES.has(upper) ||
-      upper.startsWith("OPENCLAW_") ||
-      isDangerousHostEnvVarName(name) ||
-      isDangerousHostEnvOverrideVarName(name) ||
-      isGatewayCredentialEnvVarName(name))
+    changesHowCommandsRun ||
+    (kind === "env" &&
+      (OPENCLAW_OWNED_NAMES.has(upper) ||
+        upper.startsWith("OPENCLAW_") ||
+        isGatewayCredentialEnvVarName(name)))
   ) {
     return "reserved name";
   }

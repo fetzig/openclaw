@@ -573,6 +573,8 @@ export async function runExecProcess({
       target: diagnosticTarget,
     });
   const assertPreSpawnAuthorized = () => launchLifecycle.prepare(assertSourceActive, beforeSpawn);
+  // Resolved by the first attempt; a PTY fallback reuses it rather than reading again.
+  let sessionSecretsLaunch: ReturnType<typeof resolveSessionSecretsLaunch> | undefined;
   const spawn = (input: SpawnInput) =>
     runWithAgentToolSourceExecutionScope(assertSourceActive, async () => {
       const assertSourceCurrent = assertSourceActive;
@@ -592,7 +594,7 @@ export async function runExecProcess({
           "Durable exec requires noninteractive Gateway-host execution without secret-egress proxy grants. Use non-durable background exec or a directly provided credential.",
         );
       }
-      const sessionSecrets = await resolveSessionSecretsLaunch(opts);
+      const sessionSecrets = await (sessionSecretsLaunch ??= resolveSessionSecretsLaunch(opts));
       const bindings = sessionSecrets ? sessionSecrets.bindings : opts.secretEgressBindings;
       const grant = bindings ? await registerSecretEgressProxyProcess(bindings) : undefined;
       // Egress proxy settings are OpenClaw-owned and win over session secrets.

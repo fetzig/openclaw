@@ -67,6 +67,8 @@ const mocks = vi.hoisted(() => ({
   nodeHostParams: [] as CapturedEnvironment[],
   spawnInputs: [] as Array<{ env?: Record<string, string> }>,
   durableInputs: [] as Array<{ env?: Record<string, string> }>,
+  /** PTY construction fails before launch, so runExecProcess retries without a PTY. */
+  failPty: false,
 }));
 
 // mock-isolation: Each test installs its own plugin hooks instead of the global registry.
@@ -104,6 +106,9 @@ vi.mock("../process/supervisor/index.js", () => ({
     spawn: async (input: SpawnInput) => {
       await Promise.resolve();
       input.assertCurrent?.();
+      if (mocks.failPty && input.mode === "pty") {
+        throw new Error("PTY unavailable");
+      }
       mocks.spawnInputs.push({
         env: input.env ? { ...(input.env as Record<string, string>) } : {},
       });
@@ -133,6 +138,8 @@ let value: string;
 let logs: string[];
 /** Bindings each launch registered with the egress proxy, when one is active. */
 let registered: SecretEgressSentinelBinding[][];
+/** Indexes into `registered` whose grant was revoked. */
+let revoked: number[];
 let proxy:
   | { registerProcess: (bindings?: readonly SecretEgressSentinelBinding[]) => unknown }
   | undefined;
@@ -159,8 +166,11 @@ const turn = (person: keyof typeof people | undefined, agentId = AGENT) => ({
 function activateProxy() {
   proxy = {
     registerProcess: (bindings = []) => {
-      registered.push([...bindings]);
-      return { env: { HTTPS_PROXY: "http://openclaw:token@127.0.0.1:9" }, revoke: () => {} };
+      const index = registered.push([...bindings]) - 1;
+      return {
+        env: { HTTPS_PROXY: "http://openclaw:token@127.0.0.1:9" },
+        revoke: () => void revoked.push(index),
+      };
     },
   };
   publishSecretEgressProxy(proxy as never);
@@ -283,6 +293,8 @@ beforeEach(() => {
   value = `vt-${randomUUID()}`;
   logs = [];
   registered = [];
+  revoked = [];
+  mocks.failPty = false;
   for (const method of ["log", "info", "warn", "error", "debug"] as const) {
     vi.spyOn(console, method).mockImplementation((...args) => void logs.push(args.join(" ")));
   }
@@ -945,6 +957,30 @@ describe("session secrets at launch", () => {
     expectNoLeak({ ...delivered.surfaces, otherAgent: otherAgent.surfaces, otherStore });
   });
 
+  it("a PTY fallback reads the entries once and reuses them for the retry", async () => {
+    entries(
+      { name: KEY, value, allowedHosts: ["api.example.test"] },
+      { name: "bad-name", kind: "env", value: `bad-${value}` },
+    );
+    activateProxy();
+    mocks.failPty = true;
+    const { env, warnings, surfaces } = await launch(turn("alice"), { usePty: true });
+
+    expect(providerCalls).toEqual([`readEntries:${people.alice}`]);
+    expect(warnings).toEqual([
+      expect.stringContaining("one entry with an invalid name"),
+      expect.stringContaining("retrying without PTY"),
+    ]);
+    // Each attempt gets its own grant for the same sentinel: the failed attempt's is revoked
+    // before the retry, the retry's when its command exits.
+    expect(registered).toHaveLength(2);
+    expect(registered[1]).toEqual(registered[0]);
+    expect(revoked).toEqual([0, 1]);
+    expect(env[KEY]).toBe(registered[1]![0]!.sentinel);
+    expect(resolveSecretSentinel(env[KEY]!)).toBe(value);
+    expectNoLeak({ ...surfaces, env });
+  });
+
   it("invalid, reserved, NUL and oversize entries are rejected by name only", async () => {
     const rejected = {
       "bad-name": `x-${value}`,
@@ -981,17 +1017,41 @@ describe("session secrets at launch", () => {
     expectNoLeak(surfaces);
   });
 
-  it("protected entries skip the host-env denylist, as team-store secrets do", async () => {
+  it("protected entries may use credential names but not names that change how commands run", async () => {
+    // Credential names on the override denylist stay usable, as for team-store secrets.
+    const allowed = ["GH_TOKEN", "NPM_TOKEN", "AWS_SESSION_TOKEN"];
+    // A sentinel here would break or redirect every command in the creator's sessions.
+    const refused = [
+      "PATH",
+      "HOME",
+      "NODE_OPTIONS",
+      "LD_PRELOAD",
+      "GIT_SSH_COMMAND",
+      "HTTPS_PROXY",
+    ];
     entries(
-      { name: "GH_TOKEN", value, allowedHosts: ["api.github.com"] },
-      { name: "NODE_OPTIONS", value: `n-${value}`, allowedHosts: ["api.example.test"] },
+      ...[...allowed, ...refused].map((name) => ({
+        name,
+        value: `${name}-${value}`,
+        allowedHosts: ["api.example.test"],
+      })),
     );
     activateProxy();
     const { env, warnings, surfaces } = await launch(turn("alice"));
 
-    expect(resolveSecretSentinel(env.GH_TOKEN!)).toBe(value);
-    expect(resolveSecretSentinel(env.NODE_OPTIONS!)).toBe(`n-${value}`);
-    expect(warnings).toEqual([]);
+    for (const name of allowed) {
+      expect(resolveSecretSentinel(env[name]!), name).toBe(`${name}-${value}`);
+    }
+    for (const name of refused) {
+      expect(looksLikeSecretSentinel(env[name] ?? ""), name).toBe(false);
+    }
+    expect(registered[0]!.map((binding) => binding.name).toSorted()).toEqual(allowed.toSorted());
+    expect(warnings).toEqual([
+      `Warning: session secret entries were not provided: ${refused
+        .map((name) => `${name} (reserved name)`)
+        .toSorted()
+        .join(", ")}.`,
+    ]);
     expectNoLeak(surfaces);
   });
 });
