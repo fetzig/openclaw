@@ -1047,6 +1047,7 @@ export async function processGatewayAllowlist(
       }
     };
     let gatewayInvocationStarted = false;
+    let launchWarningsStart = params.warnings.length;
 
     void (async () => {
       const approvalDecision = await resolveApprovalForExecution(sendApprovalRequestFailedFollowup);
@@ -1093,6 +1094,7 @@ export async function processGatewayAllowlist(
           const finalBindingDeniedError = new Error("gateway approval changed before spawn");
           try {
             gatewayInvocationStarted = true;
+            launchWarningsStart = params.warnings.length;
             run = await runExecProcess({
               approvalTransport: params.approvalTransport,
               command: params.command,
@@ -1100,7 +1102,7 @@ export async function processGatewayAllowlist(
               workdir: params.workdir,
               env: params.env,
               secretEgressBindings: params.secretEgressBindings,
-              requesterGrant: params.requesterGrant,
+              sessionSecrets: params.sessionSecrets,
               durable: params.durable,
               sessionId: params.sessionId,
               githubProfileDir: params.githubProfileDir,
@@ -1184,13 +1186,17 @@ export async function processGatewayAllowlist(
         params.approvalFollowupText ?? "",
         dynamicFollowupText ?? "",
       ]).join("\n\n");
-      const summary = buildGatewayExecApprovalFollowupSummary({
-        approvalId,
-        sessionId: run.session.id,
-        outcome,
-        trigger: params.trigger,
-        approvalFollowupText,
-      });
+      const summary = [
+        buildGatewayExecApprovalFollowupSummary({
+          approvalId,
+          sessionId: run.session.id,
+          outcome,
+          trigger: params.trigger,
+          approvalFollowupText,
+        }),
+        // The pending result already showed earlier warnings; launch-time ones go here.
+        ...params.warnings.slice(launchWarningsStart),
+      ].join("\n\n");
       await sendExecApprovalFollowupResult(followupTarget, summary);
     })()
       .catch(async (): Promise<void> => {

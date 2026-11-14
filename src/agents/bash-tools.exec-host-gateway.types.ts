@@ -7,14 +7,14 @@ import type {
   ExecHostCommandParams,
   ExecApprovalFollowupFactory,
 } from "./bash-tools.exec-types.js";
-import type { RequesterGrantLaunch } from "./requester-grants.js";
+import type { SessionSecretsLaunch } from "./session-secrets.js";
 import type { AgentToolResult } from "./runtime/index.js";
 
 export type ProcessGatewayAllowlistParams = ExecHostCommandParams & {
   workdir: string;
   secretEgressBindings?: readonly SecretEgressSentinelBinding[];
   /** Carried to the deferred launch after an approval wait; holds no values. */
-  requesterGrant?: RequesterGrantLaunch;
+  sessionSecrets?: SessionSecretsLaunch;
   durable?: DurableExecOptions;
   githubProfileDir?: string;
   pathPrepend?: string[];

@@ -74,7 +74,7 @@ import {
   createExecToolExecutionTimeoutResolver,
   resolveExecDefaultTimeoutSec,
 } from "./exec-tool-timeout.js";
-import { captureRequesterGrantLaunch } from "./requester-grants.js";
+import { captureSessionSecretsLaunch } from "./session-secrets.js";
 import { resolveStoredSubagentCapabilities } from "./subagents/spawn/subagent-capabilities.js";
 import { withPreparedSessionCapabilityRead } from "./subagents/spawn/subagent-session-store.js";
 import { EXEC_TOOL_DISPLAY_SUMMARY } from "./tool-description-presets.js";
@@ -437,7 +437,7 @@ export function createExecTool(defaults?: ExecToolDefaults) {
             ...preparedRunEnvironment,
             warnings,
           });
-        const requesterGrant = captureRequesterGrantLaunch(reservedKeys);
+        const sessionSecrets = captureSessionSecretsLaunch(reservedKeys);
 
         const hostApprovalParams = () => ({
           approvalTransport,
@@ -502,7 +502,7 @@ export function createExecTool(defaults?: ExecToolDefaults) {
             ...hostApprovalParams(),
             workdir,
             secretEgressBindings,
-            requesterGrant,
+            sessionSecrets,
             durable: params.durable ? durableNotifications : undefined,
             githubProfileDir,
             pathPrepend: defaultPathPrepend,
@@ -560,7 +560,7 @@ export function createExecTool(defaults?: ExecToolDefaults) {
           workdir,
           env,
           secretEgressBindings,
-          requesterGrant,
+          sessionSecrets,
           durable: params.durable ? durableNotifications : undefined,
           sessionId: defaults?.sessionId,
           githubProfileDir,

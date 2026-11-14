@@ -1412,19 +1412,35 @@ describe("processGatewayAllowlist", () => {
     expectNoCalls(commitAuthorizationMock, runExecProcessMock, followupMock);
   });
 
-  it.each(["none", "holder-disables"] as const)(
-    "8: resolves requester grants only at the deferred launch (during the wait: %s)",
+  it.each(["none", "creator-disables"] as const)(
+    "8: resolves session secrets only at the deferred launch (during the wait: %s)",
     async (revocation) => {
-      const grants = await import("./requester-grants.js");
+      const secrets = await import("./session-secrets.js");
+      const { createOpenClawTestState } = await import("../test-utils/openclaw-test-state.js");
+      const { replaceSessionEntry } = await import("../config/sessions/session-accessor.js");
+      const { resolveSessionStorePathCore } = await import("../config/sessions/paths.js");
+      const state = await createOpenClawTestState({
+        prefix: "openclaw-approval-session-secrets-",
+        layout: "state-only",
+      });
       const value = `vt-${crypto.randomUUID()}`;
       const sessionKey = "agent:main:approval-grant";
-      const storeScope = "/synthetic/approval-grant/sessions";
+      const sessionId = "approval-grant-session";
+      const storeScope = resolveSessionStorePathCore(undefined, { agentId: "main" });
       const target = { storeScope, agentId: "main", sessionKey };
-      grants.resetRequesterGrantsForTest();
-      grants.setRequesterGrantValueProviderForTest({
-        readEntries: () => ({ VAULT_TEST_TOKEN: value }),
+      await replaceSessionEntry(
+        { agentId: "main", sessionKey, storePath: storeScope },
+        {
+          sessionId,
+          updatedAt: Date.now(),
+          createdActor: { type: "human", source: "profile", id: "alice" },
+        },
+      );
+      secrets.resetSessionSecretsForTest();
+      secrets.setSessionSecretValueProviderForTest({
+        readEntries: () => [{ name: "VAULT_TEST_TOKEN", kind: "env", value }],
       });
-      grants.enableRequesterGrantForTest({ holderProfileId: "alice", target });
+      await secrets.enableSessionSecretsForTest({ requesterProfileId: "alice", target });
       const operatorAuthority = (profileId: string) =>
         createAdmittedRunOperatorAuthority({ profileId, scopes: [], assertCurrent: () => {} });
       const approval = createDeferredCore<ExecApprovalDecision>();
@@ -1467,20 +1483,24 @@ describe("processGatewayAllowlist", () => {
           runDetached({
             env: { PATH: "/usr/bin:/bin" },
             requestedEnv: { EXPLICIT: "1" },
-            requesterGrant: { reservedKeys: ["EXPLICIT"], storeScope },
+            sessionSecrets: { reservedKeys: ["EXPLICIT"], storeScope },
             sessionKey,
+            sessionId,
             warnings,
           }),
       );
       await vi.waitFor(() => expect(approvalDecisionMock).toHaveBeenCalledOnce());
-      if (revocation === "holder-disables") {
-        grants.disableRequesterGrant(target);
+      if (revocation === "creator-disables") {
+        secrets.disableSessionSecrets(target, "alice");
       }
       approval.resolve("allow-once");
       await vi.waitFor(() => expect(spawned).toHaveLength(1));
       await waitForFollowup();
 
       expect(spawned[0]?.VAULT_TEST_TOKEN).toBe(revocation === "none" ? value : undefined);
+      expect(
+        JSON.stringify(followupMock.mock.calls).includes(secrets.SESSION_SECRETS_OFF_NOTICE),
+      ).toBe(revocation === "creator-disables");
       for (const [name, surface] of Object.entries({
         approvalRequests: gatewayMock.mock.calls,
         warnings,
@@ -1491,7 +1511,9 @@ describe("processGatewayAllowlist", () => {
       })) {
         expect(JSON.stringify(surface), name).not.toContain(value);
       }
-      grants.setRequesterGrantValueProviderForTest(undefined);
+      secrets.setSessionSecretValueProviderForTest(undefined);
+      secrets.resetSessionSecretsForTest();
+      await state.cleanup();
     },
   );
 

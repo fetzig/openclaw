@@ -437,7 +437,7 @@ export function resolvePreparedExecEnvironment(params: {
 }): {
   env: Record<string, string>;
   requestedEnv?: Record<string, string>;
-  /** Names a requester grant may not set at launch; names only, never values. */
+  /** Names session secrets may not set at launch; names only, never values. */
   reservedKeys: string[];
   executionContext?: SystemRunExecutionContext;
 } {

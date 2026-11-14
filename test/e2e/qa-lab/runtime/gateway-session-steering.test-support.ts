@@ -591,6 +591,7 @@ function personHeaders(email: string) {
 export async function withPeopleGateway(
   options: Pick<QueueConfig, "allowCollaborativeSteering" | "collaborativeSteeringFallback"> & {
     exec?: NonNullable<OpenClawConfig["tools"]>["exec"];
+    secrets?: OpenClawConfig["secrets"];
   },
   run: (
     gateway: SteeringApi & {
@@ -646,6 +647,9 @@ export async function withPeopleGateway(
           options.collaborativeSteeringFallback;
         if (options.exec) {
           config.tools = { ...config.tools, exec: options.exec };
+        }
+        if (options.secrets) {
+          config.secrets = options.secrets;
         }
         const gatewayConfig: NonNullable<OpenClawConfig["gateway"]> = {
           trustedProxies: ["127.0.0.1"],
