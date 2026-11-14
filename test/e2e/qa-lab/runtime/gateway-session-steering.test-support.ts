@@ -592,6 +592,8 @@ export async function withPeopleGateway(
   options: Pick<QueueConfig, "allowCollaborativeSteering" | "collaborativeSteeringFallback"> & {
     exec?: NonNullable<OpenClawConfig["tools"]>["exec"];
     secrets?: OpenClawConfig["secrets"];
+    /** A custom `session.store`, such as `~/sessions/{agentId}/sessions.json`. */
+    sessionStore?: string;
   },
   run: (
     gateway: SteeringApi & {
@@ -650,6 +652,9 @@ export async function withPeopleGateway(
         }
         if (options.secrets) {
           config.secrets = options.secrets;
+        }
+        if (options.sessionStore) {
+          config.session = { ...config.session, store: options.sessionStore };
         }
         const gatewayConfig: NonNullable<OpenClawConfig["gateway"]> = {
           trustedProxies: ["127.0.0.1"],

@@ -584,7 +584,7 @@ export const sessionSharingHandlers: GatewayRequestHandlers = {
               {
                 storeScope: access.lifecycleStorePath,
                 agentId: current.agentId,
-                sessionKey: scope.sessionKey,
+                sessionKey: current.canonicalKey,
               },
               previous,
               visibility,

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { GATEWAY_OWNER_PROFILE_ID } from "../../packages/gateway-protocol/src/schema/user-profile-constants.js";
 import { resolveSessionStorePathCore } from "../config/sessions/paths.js";
 import {
   assignSessionOwner,
@@ -20,6 +21,9 @@ import {
   sealSecretSentinel,
 } from "../secrets/sentinel.js";
 import { withSessionTurn } from "../sessions/session-controller.admission.js";
+import { prepareUserProfileCatalog } from "../state/user-profile-list.js";
+import { mergeProfiles } from "../state/user-profile-writes.worker.js";
+import { ensureProfileForEmail } from "../state/user-profiles.js";
 import {
   createOpenClawTestState,
   type OpenClawTestState,
@@ -109,6 +113,8 @@ const OTHER_STORE = "/synthetic/session-secrets/other-sessions";
 const KEY = "VAULT_TEST_TOKEN";
 const ALICE = { type: "human", source: "profile", id: "alice" } as const;
 let state: OpenClawTestState;
+let releaseProfileCatalog: (() => void) | undefined;
+let mergedAlice: { source: string; target: string };
 let store: string;
 let value: string;
 let logs: string[];
@@ -162,7 +168,9 @@ async function launch(
       sessionKey: SESSION,
       sessionId: SESSION_ID,
       agentId: caller.agentId,
-      sessionSecrets: { storeScope: store },
+      sessionSecrets: {
+        target: { storeScope: store, agentId: caller.agentId, sessionKey: SESSION },
+      },
       approvalTransport: {
         assertExecution: (request: unknown) => transportEnvs.push(request),
       } as never,
@@ -240,11 +248,19 @@ beforeAll(async () => {
   });
   store = resolveSessionStorePathCore(undefined, { agentId: AGENT });
   await writeSession(SESSION, { createdActor: ALICE });
+  // Alice signed in under a second profile that an admin merged with her first one.
+  const source = ensureProfileForEmail("alice-old@example.test").id;
+  const mergeTarget = ensureProfileForEmail("alice@example.test").id;
+  mergeProfiles(source, mergeTarget);
+  mergedAlice = { source, target: mergeTarget };
+  // The Gateway prepares the profile catalog at admission; alias checks read it.
+  releaseProfileCatalog = (await prepareUserProfileCatalog()).release;
   ({ createExecTool } = await import("./bash-tools.exec-run.js"));
   ({ toToolDefinitions } = await import("./agent-tool-definition-adapter.js"));
 });
 
 afterAll(async () => {
+  releaseProfileCatalog?.();
   await state?.cleanup();
 });
 
@@ -313,6 +329,12 @@ describe("who can turn session secrets on", () => {
     ["a child session", { createdActor: ALICE, parentSessionKey: SESSION }, undefined],
     ["a spawned session", { createdActor: ALICE, spawnedBy: SESSION }, undefined],
     ["no recorded creator", {}, undefined],
+    // Every token or password connection signs in as this one profile; it is not a person.
+    [
+      "the shared Gateway owner profile",
+      { createdActor: { type: "human", source: "profile", id: GATEWAY_OWNER_PROFILE_ID } },
+      undefined,
+    ],
   ] as const)("%s", async (_label, fields, creator) => {
     const sessionKey = `agent:main:dashboard:creator-${randomUUID()}`;
     const { owner, ...entry } = fields as Partial<SessionEntry> & { owner?: string };
@@ -324,7 +346,7 @@ describe("who can turn session secrets on", () => {
       assignSessionOwner(scope, { owner: bob, assignedBy: bob });
       expect(loadSessionEntry(scope)?.owner?.actor.id).toBe(owner);
     }
-    for (const requester of ["alice", "bob", "carol"]) {
+    for (const requester of ["alice", "bob", "carol", GATEWAY_OWNER_PROFILE_ID]) {
       const attempt = enableSessionSecretsForTest({
         requesterProfileId: requester,
         target: target(sessionKey),
@@ -336,6 +358,18 @@ describe("who can turn session secrets on", () => {
       }
     }
     expect(readSessionSecretsCreatorForTest(target(sessionKey))).toBe(creator);
+  });
+
+  it("a profile merged with the creator counts as the creator", async () => {
+    const sessionKey = `agent:main:dashboard:alias-${randomUUID()}`;
+    await writeSession(sessionKey, {
+      createdActor: { type: "human", source: "profile", id: mergedAlice.source },
+    });
+    await enableSessionSecretsForTest({
+      requesterProfileId: mergedAlice.target,
+      target: target(sessionKey),
+    });
+    expect(readSessionSecretsCreatorForTest(target(sessionKey))).toBe(mergedAlice.target);
   });
 
   it("refuses a session that does not exist and only the creator turns them off", async () => {
@@ -354,7 +388,7 @@ describe("who can turn session secrets on", () => {
 });
 
 it("a visibility change ends session secrets only when more people can send", async () => {
-  // Draft: creator and admins. Read-only, Suggest: plus owner and members. Shared: everyone.
+  // Draft: creator and admins. Read-only, Suggest: plus invited members. Shared: everyone.
   const widening = new Set([
     "draft>read-only",
     "draft>suggest",
@@ -372,6 +406,25 @@ it("a visibility change ends session secrets only when more people can send", as
       );
     }
   }
+});
+
+it("enable, the visibility hook and the launch name one session however its key is spelled", async () => {
+  // Enabled under the agent-relative alias; launches and the hook use the canonical key.
+  await enableSessionSecretsForTest({
+    requesterProfileId: "alice",
+    target: { storeScope: store, agentId: AGENT, sessionKey: "dashboard:vault" },
+  });
+  const on = await execToolInTurn(turn("bob"), { command: "echo ok" });
+  endSessionSecretsIfSendersWiden(
+    { storeScope: store, agentId: AGENT, sessionKey: SESSION },
+    "draft",
+    "shared",
+  );
+  const off = await execToolInTurn(turn("bob"), { command: "echo ok" });
+
+  expect(mocks.spawnInputs.map((input) => input.env?.[KEY])).toEqual([value, undefined]);
+  expect(JSON.stringify(off)).toContain(SESSION_SECRETS_OFF_NOTICE);
+  expectNoLeak({ on, off, logs });
 });
 
 describe("session secrets at launch", () => {
@@ -439,14 +492,16 @@ describe("session secrets at launch", () => {
     expectNoLeak({ ...withoutProxy.surfaces, withProxy: withProxy.surfaces });
   });
 
-  it("OpenClaw-set > per-call env > plugin env > session secrets > team store", async () => {
+  it("OpenClaw-set > plugin resolve_exec_env > per-call env > session secrets > team store", async () => {
     const teamSentinel = sealSecretSentinel(`team-${value}`, { label: "exec-store:BOTH_SECRET" });
     entries(
-      ...["OWNED_KEY", "CALL_KEY", "PLUGIN_KEY", "BOTH_ENV", "INHERITED"].map((name) => ({
-        name,
-        kind: "env" as const,
-        value: `${name}-${value}`,
-      })),
+      ...["OWNED_KEY", "CALL_KEY", "PLUGIN_KEY", "CALL_AND_PLUGIN", "BOTH_ENV", "INHERITED"].map(
+        (name) => ({
+          name,
+          kind: "env" as const,
+          value: `${name}-${value}`,
+        }),
+      ),
       { name: "BOTH_SECRET", value, allowedHosts: ["api.example.test"] },
     );
     await enable();
@@ -454,12 +509,15 @@ describe("session secrets at launch", () => {
     vi.stubEnv("INHERITED", "inherited");
     mocks.hookRunner = {
       hasHooks: (name: string) => name === "resolve_exec_env",
-      runResolveExecEnv: vi.fn(async () => ({ PLUGIN_KEY: "from-plugin" })),
+      runResolveExecEnv: vi.fn(async () => ({
+        PLUGIN_KEY: "from-plugin",
+        CALL_AND_PLUGIN: "from-plugin",
+      })),
       runBeforeToolCall: vi.fn(),
     };
     const result = await execToolInTurn(
       turn("bob"),
-      { command: "echo ok", env: { CALL_KEY: "per-call" } },
+      { command: "echo ok", env: { CALL_KEY: "per-call", CALL_AND_PLUGIN: "per-call" } },
       {
         defaults: {
           operationalRunInstance: createOperationalRunInstanceRef(`run-${randomUUID()}`),
@@ -485,6 +543,7 @@ describe("session secrets at launch", () => {
       OWNED_KEY: "openclaw",
       CALL_KEY: "per-call",
       PLUGIN_KEY: "from-plugin",
+      CALL_AND_PLUGIN: "from-plugin",
       BOTH_ENV: `BOTH_ENV-${value}`,
       INHERITED: `INHERITED-${value}`,
       STORE_ONLY: "team",
@@ -501,16 +560,23 @@ describe("session secrets at launch", () => {
     });
   });
 
-  it("a command launched after the creator turned them off runs without them and says so", async () => {
+  it("a command launched after the creator turned them off runs without them and says so once", async () => {
     const neverOn = await execToolInTurn(turn("bob"), { command: "echo ok" });
     await enable();
     disableSessionSecrets(target(), "alice");
     const afterOff = await execToolInTurn(turn("bob"), { command: "echo ok" });
+    const later = await execToolInTurn(turn("bob"), { command: "echo ok" });
 
-    expect(mocks.spawnInputs.map((input) => input.env?.[KEY])).toEqual([undefined, undefined]);
+    expect(mocks.spawnInputs.map((input) => input.env?.[KEY])).toEqual([
+      undefined,
+      undefined,
+      undefined,
+    ]);
     expect(JSON.stringify(neverOn)).not.toContain(SESSION_SECRETS_OFF_NOTICE);
     expect(JSON.stringify(afterOff)).toContain(SESSION_SECRETS_OFF_NOTICE);
-    expectNoLeak({ neverOn, afterOff, logs });
+    // Said once: later launches run without them silently.
+    expect(JSON.stringify(later)).not.toContain(SESSION_SECRETS_OFF_NOTICE);
+    expectNoLeak({ neverOn, afterOff, later, logs });
   });
 
   it.each([
@@ -553,7 +619,7 @@ describe("session secrets at launch", () => {
           sessionKey: SESSION,
           sessionId: SESSION_ID,
           agentId: AGENT,
-          sessionSecrets: { storeScope: store },
+          sessionSecrets: { target: target() },
         }),
       ),
     ).rejects.toThrow(SESSION_SECRETS_ENDED_ERROR);
@@ -561,29 +627,49 @@ describe("session secrets at launch", () => {
     expectNoLeak({ warnings, logs });
   });
 
-  it("a Gateway restart, a reset session, another agent or another store get nothing", async () => {
+  it("another agent or another store get nothing", async () => {
     await enable();
     const delivered = await launch(turn("alice"));
-    const resetSession = await launch(turn("alice"), { sessionId: "after-reset" });
     const otherAgent = await launch(turn("alice", "other"));
     const otherStore = await execToolInTurn(
       turn("alice"),
       { command: "echo ok" },
       { storeScope: OTHER_STORE },
     );
+
+    expect(delivered.env[KEY]).toBe(value);
+    expect(otherAgent.env[KEY]).toBeUndefined();
+    expect(mocks.spawnInputs.at(-1)?.env?.[KEY]).toBeUndefined();
+    expect(readSessionSecretsCreatorForTest(target())).toBe("alice");
+    expectNoLeak({ ...delivered.surfaces, otherAgent: otherAgent.surfaces, otherStore });
+  });
+
+  it("a reset session or a Gateway restart ends them; status then reads off", async () => {
+    await enable();
+    const resetSession = await launch(turn("alice"), { sessionId: "after-reset" });
+    const afterReset = await launch(turn("alice"), { sessionId: "after-reset" });
+    expect(readSessionSecretsCreatorForTest(target())).toBeUndefined();
+    // `/new` on a dashboard session keeps its sessionId and rotates only lifecycleRevision.
+    await enable();
+    await writeSession(SESSION, { createdActor: ALICE, lifecycleRevision: randomUUID() });
+    const rotated = await launch(turn("alice"));
+    expect(readSessionSecretsCreatorForTest(target())).toBeUndefined();
+    await enable();
     resetSessionSecretsForTest();
     const restarted = await launch(turn("alice"));
 
-    expect(delivered.env[KEY]).toBe(value);
-    for (const result of [resetSession, otherAgent, restarted]) {
+    for (const result of [resetSession, afterReset, rotated, restarted]) {
       expect(result.env[KEY]).toBeUndefined();
     }
-    expect(mocks.spawnInputs.at(-2)?.env?.[KEY]).toBeUndefined();
+    expect(resetSession.warnings).toEqual([SESSION_SECRETS_OFF_NOTICE]);
+    expect(afterReset.warnings).toEqual([]);
+    expect(rotated.warnings).toEqual([SESSION_SECRETS_OFF_NOTICE]);
+    // A restart forgets everything, including that they were ever on.
+    expect(restarted.warnings).toEqual([]);
     expectNoLeak({
-      ...delivered.surfaces,
       resetSession: resetSession.surfaces,
-      otherAgent: otherAgent.surfaces,
-      otherStore,
+      afterReset: afterReset.surfaces,
+      rotated: rotated.surfaces,
       restarted: restarted.surfaces,
     });
   });
@@ -600,11 +686,13 @@ describe("session secrets at launch", () => {
   it("invalid, reserved, NUL and oversize entries are rejected by name only", async () => {
     const rejected = {
       "bad-name": `x-${value}`,
+      lower_case: `l-${value}`,
       GH_TOKEN: `gh-${value}`,
       LD_PRELOAD: `ld-${value}`,
       OPENCLAW_SHELL: `oc-${value}`,
       NUL_VALUE: `a\0${value}`,
-      BIG: `${value}${"x".repeat(17 * 1024)}`,
+      // Over the team store's 64 KiB value limit.
+      BIG: `${value}${"x".repeat(64 * 1024)}`,
     };
     entries(
       ...Object.entries(rejected).map(([name, entryValue]) => ({
@@ -625,10 +713,25 @@ describe("session secrets at launch", () => {
       "LD_PRELOAD (reserved name)",
       "NUL_VALUE (NUL byte)",
       "OPENCLAW_SHELL (reserved name)",
-      "one entry with an invalid name",
+      "one entry with an invalid name, one entry with an invalid name",
     ]) {
       expect(warnings[0]).toContain(part);
     }
+    expectNoLeak(surfaces);
+  });
+
+  it("protected entries skip the host-env denylist, as team-store secrets do", async () => {
+    entries(
+      { name: "GH_TOKEN", value, allowedHosts: ["api.github.com"] },
+      { name: "NODE_OPTIONS", value: `n-${value}`, allowedHosts: ["api.example.test"] },
+    );
+    await enable();
+    activateProxy();
+    const { env, warnings, surfaces } = await launch(turn("alice"));
+
+    expect(resolveSecretSentinel(env.GH_TOKEN!)).toBe(value);
+    expect(resolveSecretSentinel(env.NODE_OPTIONS!)).toBe(`n-${value}`);
+    expect(warnings).toEqual([]);
     expectNoLeak(surfaces);
   });
 });

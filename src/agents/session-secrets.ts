@@ -1,4 +1,3 @@
-import { sessionIsolationProfileId } from "../config/sessions/session-entry-provenance.js";
 /**
  * Spike (openclaw#197297): creator-bound session secrets.
  *
@@ -9,7 +8,11 @@ import { sessionIsolationProfileId } from "../config/sessions/session-entry-prov
  * from a provider at launch only and never stored here. State is process memory: a
  * Gateway restart turns everything off.
  */
+import { GATEWAY_OWNER_PROFILE_ID } from "../../packages/gateway-protocol/src/schema/user-profile-constants.js";
+import { sessionCreatorProfileId } from "../config/sessions/session-entry-provenance.js";
 import type { SessionEntry } from "../config/sessions/types.js";
+import { isSessionCreatorProfile } from "../gateway/session-creator.js";
+import { canonicalizeSessionKeyForAgent } from "../gateway/session-store-key.js";
 import {
   isDangerousHostEnvOverrideVarName,
   isDangerousHostEnvVarName,
@@ -19,7 +22,9 @@ import { registerSecretValueForRedaction } from "../logging/secret-redaction-reg
 import { normalizeAgentId } from "../routing/session-key.js";
 import type { SecretEgressSentinelBinding } from "../secrets/egress-proxy/proxy-server.js";
 import { isSecretEgressProxyActive } from "../secrets/egress-proxy/registry.js";
+import { ENV_SECRET_REF_ID_RE } from "../secrets/ref-contract.js";
 import { sealSecretSentinel } from "../secrets/sentinel.js";
+import { SECRET_STORE_VALUE_MAX_BYTES } from "../secrets/store/secret-store-validation-error.js";
 import { normalizeSecretAllowedHosts } from "../secrets/store/secret-store-validation.js";
 import { getCurrentSessionControllerOwner } from "../sessions/session-controller.context.js";
 import {
@@ -55,17 +60,22 @@ export type SessionSecretValueProvider = {
 
 /** Captured when the exec tool runs and carried to the launch, also after an approval wait. */
 export type SessionSecretsLaunch = Readonly<{
-  /** Session store of the turn that ran the tool; absent outside a session turn. */
-  storeScope?: string;
+  /** The session controller target of the turn that ran the tool; absent outside a session turn. */
+  target?: SessionSecretsTarget;
   /** Names owned by OpenClaw or set for this call (per-call or plugin env); never values. */
   reservedKeys?: readonly string[];
 }>;
 
 type SessionSecrets = {
+  /** The verified profile that turned them on: the creator or a profile merged with it. */
   readonly creatorProfileId: string;
-  /** The session incarnation they were turned on for; a reset session gets none. */
+  /**
+   * The session incarnation they were turned on for; a reset session gets none. `/new`
+   * keeps a dashboard session's sessionId and rotates only its lifecycleRevision.
+   */
   readonly sessionId: string;
-  /** targetKey() of the session. */
+  readonly lifecycleRevision?: string;
+  /** sessionSecretsKey() of the session. */
   readonly key: string;
   readonly entryNames?: readonly string[];
 };
@@ -74,14 +84,13 @@ export const SESSION_SECRETS_OFF_NOTICE = "Session secrets are off; this command
 export const SESSION_SECRETS_ENDED_ERROR =
   "Session secrets ended before the command started; it was not run. Ask the session creator to turn them on again.";
 
-const MAX_VALUE_BYTES = 16 * 1024;
 const MAX_ENTRIES = 64;
-const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** OpenClaw-owned names that session secrets can never set, even when no reserved key covers them. */
 const OPENCLAW_OWNED_NAMES = new Set(["GH_TOKEN", "GITHUB_TOKEN", "PATH", "HOME"]);
 /**
  * Who can send, by visibility: Draft admits only the creator and admins; Read-only and
- * Suggest add owner and members; Shared adds everyone who can see the session.
+ * Suggest add invited members (an assigned owner gets no send right from that role);
+ * Shared adds everyone who can see the session.
  */
 const SENDER_REACH = { draft: 0, "read-only": 1, suggest: 1, shared: 2 } as const;
 type SessionVisibility = keyof typeof SENDER_REACH;
@@ -94,10 +103,29 @@ const state = resolveGlobalSingleton(Symbol.for("openclaw.sessionSecrets"), () =
   provider: undefined as SessionSecretValueProvider | undefined,
 }));
 
-const agentOf = (target: Omit<SessionSecretsTarget, "storeScope">) =>
+const agentOf = (target: SessionSecretsTarget) =>
   normalizeAgentId(target.agentId ?? target.sessionKey.trim().split(":")[1]);
-const targetKey = (target: SessionSecretsTarget) =>
-  `${target.storeScope.trim()}\0${agentOf(target)}\0${target.sessionKey.trim()}`;
+
+/**
+ * The one registry key for a session, whoever names it: the enable request, the visibility
+ * hook (sharing target) and the launch (session controller target). Keys are canonicalized
+ * for their agent, so an alias such as `dashboard:x` and `agent:main:dashboard:x` agree.
+ */
+export function sessionSecretsKey(target: SessionSecretsTarget): string {
+  const agentId = agentOf(target);
+  const sessionKey = canonicalizeSessionKeyForAgent(agentId, target.sessionKey.trim());
+  return `${target.storeScope.trim()}\0${agentId}\0${sessionKey}`;
+}
+
+async function loadEntry(target: SessionSecretsTarget) {
+  const { loadSessionEntry } = await import("../config/sessions/session-accessor.js");
+  const agentId = agentOf(target);
+  return loadSessionEntry({
+    agentId,
+    sessionKey: canonicalizeSessionKeyForAgent(agentId, target.sessionKey.trim()),
+    storePath: target.storeScope,
+  });
+}
 
 function end(key: string): void {
   if (state.sessions.delete(key)) {
@@ -106,18 +134,25 @@ function end(key: string): void {
 }
 
 /**
- * The only profile that may turn session secrets on: the session's write-once creator,
- * when it is a verified Gateway profile. Channel senders, agents, automations, delegated
- * creations and child sessions have none. The assignable owner never counts.
+ * Only the session's write-once creator, when it is a verified person's Gateway profile,
+ * may turn session secrets on; a profile merged with the creator counts as the creator.
+ * Channel senders, agents, automations, delegated creations, child sessions and the shared
+ * Gateway owner profile (every token or password connection) have none. The assignable
+ * owner never counts.
  */
-export function resolveSessionSecretsCreator(
+export function isSessionSecretsCreator(
   entry: Pick<SessionEntry, "createdActor" | "spawnedBy" | "parentSessionKey"> | undefined,
-): string | undefined {
+  requesterProfileId: string,
+): boolean {
   const actor = entry?.createdActor;
   if (!actor || actor.delegatedBy || entry.spawnedBy || entry.parentSessionKey) {
-    return undefined;
+    return false;
   }
-  return sessionIsolationProfileId(actor)?.trim() || undefined;
+  return (
+    requesterProfileId !== GATEWAY_OWNER_PROFILE_ID &&
+    sessionCreatorProfileId(actor) !== GATEWAY_OWNER_PROFILE_ID &&
+    isSessionCreatorProfile(actor, requesterProfileId)
+  );
 }
 
 /**
@@ -129,21 +164,16 @@ export async function enableSessionSecretsForTest(params: {
   target: SessionSecretsTarget;
   entryNames?: readonly string[];
 }): Promise<void> {
-  const { loadSessionEntry } = await import("../config/sessions/session-accessor.js");
-  const entry = loadSessionEntry({
-    agentId: agentOf(params.target),
-    sessionKey: params.target.sessionKey,
-    storePath: params.target.storeScope,
-  });
-  const creator = resolveSessionSecretsCreator(entry);
-  if (!entry?.sessionId || !creator || creator !== params.requesterProfileId) {
+  const entry = await loadEntry(params.target);
+  if (!entry?.sessionId || !isSessionSecretsCreator(entry, params.requesterProfileId)) {
     throw new Error("Only the session's creator can turn on session secrets.");
   }
-  const key = targetKey(params.target);
+  const key = sessionSecretsKey(params.target);
   state.ended.delete(key);
   state.sessions.set(key, {
-    creatorProfileId: creator,
+    creatorProfileId: params.requesterProfileId,
     sessionId: entry.sessionId,
+    ...(entry.lifecycleRevision ? { lifecycleRevision: entry.lifecycleRevision } : {}),
     key,
     ...(params.entryNames ? { entryNames: Object.freeze([...params.entryNames]) } : {}),
   });
@@ -154,7 +184,7 @@ export function disableSessionSecrets(
   target: SessionSecretsTarget,
   requesterProfileId: string,
 ): void {
-  const key = targetKey(target);
+  const key = sessionSecretsKey(target);
   if (state.sessions.get(key)?.creatorProfileId === requesterProfileId) {
     end(key);
   }
@@ -167,7 +197,7 @@ export function endSessionSecretsIfSendersWiden(
   next: SessionVisibility,
 ): void {
   if (SENDER_REACH[next] > SENDER_REACH[previous]) {
-    end(targetKey(target));
+    end(sessionSecretsKey(target));
   }
 }
 
@@ -179,7 +209,7 @@ export function setSessionSecretValueProviderForTest(
 
 /** Whose secrets the session uses, never values. */
 export function readSessionSecretsCreatorForTest(target: SessionSecretsTarget): string | undefined {
-  return state.sessions.get(targetKey(target))?.creatorProfileId;
+  return state.sessions.get(sessionSecretsKey(target))?.creatorProfileId;
 }
 
 /** Gateway restart: the registry is memory-only. */
@@ -188,24 +218,30 @@ export function resetSessionSecretsForTest(): void {
   state.ended.clear();
 }
 
-function rejectionReason(name: string, value: string): string | undefined {
-  if (!ENV_NAME.test(name)) {
+/**
+ * Mirrors the team store: names match its pattern and values its 64 KiB limit; plaintext
+ * `env` entries also pass the host-env denylist, while `secret` entries are sentinels, not
+ * live credentials, so names such as GH_TOKEN stay usable.
+ */
+function rejectionReason(name: string, value: string, kind: "secret" | "env"): string | undefined {
+  if (!ENV_SECRET_REF_ID_RE.test(name)) {
     return "invalid name";
   }
   const upper = name.toUpperCase();
   if (
-    OPENCLAW_OWNED_NAMES.has(upper) ||
-    upper.startsWith("OPENCLAW_") ||
-    isDangerousHostEnvVarName(name) ||
-    isDangerousHostEnvOverrideVarName(name) ||
-    isGatewayCredentialEnvVarName(name)
+    kind === "env" &&
+    (OPENCLAW_OWNED_NAMES.has(upper) ||
+      upper.startsWith("OPENCLAW_") ||
+      isDangerousHostEnvVarName(name) ||
+      isDangerousHostEnvOverrideVarName(name) ||
+      isGatewayCredentialEnvVarName(name))
   ) {
     return "reserved name";
   }
   if (value.includes("\0")) {
     return "NUL byte";
   }
-  if (Buffer.byteLength(value) > MAX_VALUE_BYTES) {
+  if (Buffer.byteLength(value) > SECRET_STORE_VALUE_MAX_BYTES) {
     return "too large";
   }
   return undefined;
@@ -223,12 +259,21 @@ function allowedHostsOf(entry: SessionSecretEntry): string[] | undefined {
 /** Captures the physical session the current turn runs in, from its session controller entry. */
 export function captureSessionSecretsLaunch(reservedKeys: readonly string[]): SessionSecretsLaunch {
   const owner = getCurrentSessionControllerOwner();
+  const target =
+    owner && isCurrentSessionControllerOperation(owner)
+      ? getSessionControllerEntryForOperation(owner).target
+      : undefined;
   return {
     reservedKeys,
-    storeScope:
-      owner && isCurrentSessionControllerOperation(owner)
-        ? getSessionControllerEntryForOperation(owner).target?.storeScope
-        : undefined,
+    ...(target
+      ? {
+          target: {
+            storeScope: target.storeScope,
+            agentId: target.agentId,
+            sessionKey: target.sessionKey,
+          },
+        }
+      : {}),
   };
 }
 
@@ -238,7 +283,6 @@ export function captureSessionSecretsLaunch(reservedKeys: readonly string[]): Se
  * for the sentinels, and a synchronous re-check for the final spawn boundary.
  */
 export async function resolveSessionSecretsLaunch(
-  caller: Readonly<{ agentId?: string; sessionKey?: string }> | undefined,
   launch: Readonly<{
     sessionId?: string;
     /** Sandbox and durable launches never receive values. */
@@ -258,15 +302,26 @@ export async function resolveSessionSecretsLaunch(
     }
   | undefined
 > {
-  const storeScope = launch.sessionSecrets?.storeScope;
-  if (!caller?.sessionKey || !storeScope) {
+  const target = launch.sessionSecrets?.target;
+  if (!target) {
     return undefined;
   }
-  const key = targetKey({ storeScope, agentId: caller.agentId, sessionKey: caller.sessionKey });
-  const secrets = state.sessions.get(key);
-  // A reset or replaced session is a new incarnation with its own creator.
-  if (!secrets || secrets.sessionId !== launch.sessionId) {
-    if (state.ended.has(key)) {
+  const key = sessionSecretsKey(target);
+  let secrets = state.sessions.get(key);
+  // A reset or replaced session is a new incarnation: they end. One entry read per launch.
+  const current = secrets ? await loadEntry(target) : undefined;
+  if (
+    secrets &&
+    (secrets.sessionId !== launch.sessionId ||
+      current?.sessionId !== secrets.sessionId ||
+      current.lifecycleRevision !== secrets.lifecycleRevision)
+  ) {
+    end(key);
+    secrets = undefined;
+  }
+  if (!secrets) {
+    // The first launch after they ended says so, once.
+    if (state.ended.delete(key)) {
       launch.warnings.push(SESSION_SECRETS_OFF_NOTICE);
     }
     return undefined;
@@ -294,11 +349,13 @@ export async function resolveSessionSecretsLaunch(
     const kind = entry.kind ?? "secret";
     const allowedHosts = kind === "secret" ? allowedHostsOf(entry) : undefined;
     const reason =
-      rejectionReason(name, value) ??
+      rejectionReason(name, value, kind) ??
       (kind === "secret" && !allowedHosts ? "no valid allowed hosts" : undefined) ??
       (++count > MAX_ENTRIES ? "too many" : undefined);
     if (reason) {
-      rejected.push(ENV_NAME.test(name) ? `${name} (${reason})` : "one entry with an invalid name");
+      rejected.push(
+        ENV_SECRET_REF_ID_RE.test(name) ? `${name} (${reason})` : "one entry with an invalid name",
+      );
       continue;
     }
     // OpenClaw-set, per-call and plugin values win over session secrets.

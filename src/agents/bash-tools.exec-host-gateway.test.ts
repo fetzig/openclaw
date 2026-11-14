@@ -1483,7 +1483,7 @@ describe("processGatewayAllowlist", () => {
           runDetached({
             env: { PATH: "/usr/bin:/bin" },
             requestedEnv: { EXPLICIT: "1" },
-            sessionSecrets: { reservedKeys: ["EXPLICIT"], storeScope },
+            sessionSecrets: { reservedKeys: ["EXPLICIT"], target },
             sessionKey,
             sessionId,
             warnings,

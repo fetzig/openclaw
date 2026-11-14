@@ -121,7 +121,7 @@ function probe(origins: { allowed: string; denied: string }) {
  * Starts a scenario: random values for Alice's protected and plaintext entries, a fresh
  * session in the agent's default store, and capture of every log record and console write.
  */
-async function prepare(gateway: People) {
+async function prepare(gateway: People, sessionStore?: string) {
   const secretValue = `vs-${randomUUID()}`;
   const plainValue = `vp-${randomUUID()}`;
   const plainHash = createHash("sha256").update(plainValue).digest("hex");
@@ -137,8 +137,8 @@ async function prepare(gateway: People) {
   });
   const session = gateway.session();
   const target = {
-    // The default store the Gateway uses for agent "main" in this state directory.
-    storeScope: resolveSessionStorePathCore(undefined, { agentId: "main" }),
+    // The store the Gateway uses for agent "main": the default one or `session.store`.
+    storeScope: resolveSessionStorePathCore(sessionStore, { agentId: "main" }),
     agentId: "main",
     sessionKey: session.sessionKey,
   };
@@ -164,12 +164,12 @@ async function prepare(gateway: People) {
     profileId: profile.id,
     creator: () => readSessionSecretsCreatorForTest(target),
     /** Values may reach only the spawned process and the allowed host: never chat, events, model, logs or disk. */
-    expectNoLeak: async () => {
+    expectNoLeak: async (historyBeforeReset?: unknown) => {
       for (const restore of restoreWrites) {
         restore();
       }
       const surfaces: Record<string, unknown> = {
-        "chat.history": await session.history(),
+        "chat.history": [historyBeforeReset, await session.history()],
         "Gateway events": gateway.events,
         "model requests": gateway.model.requests,
         "log records": logs,
@@ -210,7 +210,7 @@ async function prepare(gateway: People) {
 }
 
 /** Each exec call's output in the conversation the model last received, in order. */
-function execOutputs(session: SteeringSession): string[] {
+function execOutputs(session: Pick<SteeringSession, "requests">): string[] {
   return (session.requests().at(-1)?.input ?? [])
     .filter((item) => item.type === "function_call_output")
     .map((item) => JSON.stringify(item.output));
@@ -219,6 +219,8 @@ function execOutputs(session: SteeringSession): string[] {
 /** One probe line's value; outputs are JSON-encoded, so lines end at `\n` or the string. */
 const line = (output: string, label: string) =>
   new RegExp(`${label}:([^\\\\"]*)`).exec(output)?.[1];
+
+const CUSTOM_STORE = "~/custom-sessions/{agentId}/sessions.json";
 
 const PEOPLE_GATEWAY = {
   exec: { mode: "full" },
@@ -240,6 +242,8 @@ it(
         async (_request, response) => replyText(response, "Bob's check ran."),
         async (_request, response) => writeToolCall(response, "exec", { command }),
         async (_request, response) => replyText(response, "Bob's second check ran."),
+        async (_request, response) => writeToolCall(response, "exec", { command }),
+        async (_request, response) => replyText(response, "The check after /new ran."),
       );
 
       const created = await session.send("Alice opens the session.");
@@ -286,7 +290,28 @@ it(
         { host: DENIED_HOST, path: "/control" },
       ]);
       expect(roleTexts(await session.history(), "assistant")).toContain("Bob's second check ran.");
-      await expectNoLeak();
+
+      // A reset starts a new session incarnation: session secrets end with the old one.
+      const historyBeforeReset = await session.history();
+      await enableSessionSecretsForTest({ requesterProfileId: profileId, target });
+      // `/new` answers without a model turn and keeps the session's key and sessionId.
+      const reset = await session.send("/new");
+      expect(await session.wait(reset.runId)).toMatchObject({ status: "ok" });
+      const again = await session.send("Alice checks again in the new session.");
+      expect(await session.wait(again.runId)).toMatchObject({ status: "ok" });
+      // The new incarnation's model requests no longer carry earlier messages.
+      const [afterReset] = execOutputs({ requests: () => gateway.model.requests });
+      expect(afterReset).toBeDefined();
+      expect(line(afterReset!, "secret-env")).toBe("");
+      expect(line(afterReset!, "plain")).toBe("absent");
+      expect(afterReset).toContain(SESSION_SECRETS_OFF_NOTICE);
+      expect(creator()).toBeUndefined();
+      expect(origins.received.slice(5).map((request) => request.authorization)).toEqual([
+        "Bearer",
+        "Bearer",
+        undefined,
+      ]);
+      await expectNoLeak(historyBeforeReset);
     }),
 );
 
@@ -294,10 +319,13 @@ it(
   "a visibility change that lets more people send ends them from the next launch",
   { timeout: TEST_TIMEOUT_MS },
   () =>
-    withPeopleGateway(PEOPLE_GATEWAY, async (gateway) => {
+    // A custom session.store: the hook and the launch must name the same physical session.
+    withPeopleGateway({ ...PEOPLE_GATEWAY, sessionStore: CUSTOM_STORE }, async (gateway) => {
       const origins = await startOrigins(gateway.home);
-      const { plainHash, session, target, profileId, creator, expectNoLeak } =
-        await prepare(gateway);
+      const { plainHash, session, target, profileId, creator, expectNoLeak } = await prepare(
+        gateway,
+        CUSTOM_STORE,
+      );
       const command = probe(origins);
       gateway.model.script(
         async (_request, response) => replyText(response, "Draft created."),
@@ -314,9 +342,10 @@ it(
 
       const created = await session.send("Alice opens a draft.");
       expect(await session.wait(created.runId)).toMatchObject({ status: "ok" });
-      await setVisibility("draft");
+      await setVisibility("read-only");
       await enableSessionSecretsForTest({ requesterProfileId: profileId, target });
-      // Narrowing or keeping who can send leaves them on.
+      // Narrowing who can send (Read-only to Draft) or keeping it leaves them on.
+      await setVisibility("draft");
       await setVisibility("draft");
       expect(creator()).toBe(profileId);
 
@@ -330,6 +359,8 @@ it(
       expect(await session.wait(bobTurn.runId)).toMatchObject({ status: "ok" });
       const [draft, shared] = execOutputs(session);
       expect(line(draft!, "plain")).toBe(`present:${plainHash}`);
+      expect(line(draft!, "secret-env")).toMatch(/^oc-sent-v2\./);
+      expect(line(shared!, "secret-env")).toBe("");
       expect(line(shared!, "plain")).toBe("absent");
       expect(shared).toContain(SESSION_SECRETS_OFF_NOTICE);
       await expectNoLeak();

@@ -262,8 +262,7 @@ export async function runExecProcess({
       : (requestSignal ?? initialStartupSignal);
   let assertSourceActive: SessionSourceAssertion | undefined =
     captureAgentToolSourceExecutionGuard(startupSignal);
-  const caller = getGatewayToolCallerIdentity();
-  let operatorAuthority = caller?.operatorAuthority;
+  let operatorAuthority = getGatewayToolCallerIdentity()?.operatorAuthority;
   const operatorSignal = operatorAuthority?.signal;
   let releaseOperatorAuthority: (() => void) | undefined;
   const startedAt = Date.now();
@@ -595,7 +594,7 @@ export async function runExecProcess({
           "Durable exec requires noninteractive Gateway-host execution without secret-egress proxy grants. Use non-durable background exec or a directly provided credential.",
         );
       }
-      sessionSecrets = await resolveSessionSecretsLaunch(caller, opts);
+      sessionSecrets = await resolveSessionSecretsLaunch(opts);
       const bindings = sessionSecrets ? sessionSecrets.bindings : opts.secretEgressBindings;
       const grant = bindings ? await registerSecretEgressProxyProcess(bindings) : undefined;
       // Egress proxy settings are OpenClaw-owned and win over session secrets.
