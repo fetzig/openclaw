@@ -17,6 +17,7 @@ import {
 import { resolveSessionStorePathCore } from "../../../../src/config/sessions/paths.js";
 import { loadSessionEntry } from "../../../../src/config/sessions/session-accessor.js";
 import { listDirectoryTreeStrict } from "../../../../src/infra/directory-walk.js";
+import { getSessionBindingService } from "../../../../src/infra/outbound/session-binding-service.js";
 import {
   getLogger,
   getResolvedLoggerFileTarget,
@@ -129,7 +130,12 @@ async function prepare(gateway: People, sessionStore?: string) {
   ];
   const read = (profileId: string) => (profileId === profile.id ? vault : []);
   setSessionSecretValueProviderForTest({
-    listNames: (profileId) => read(profileId).map((entry) => entry.name),
+    listNames: (profileId) =>
+      read(profileId).map(({ name, kind = "secret", allowedHosts }) => ({
+        name,
+        kind,
+        allowedHosts,
+      })),
     readEntries: read,
   });
   const session = gateway.session();
@@ -339,7 +345,7 @@ it(
 );
 
 it(
-  "the agent's main session Alice created gets none of her entries; her dashboard session does",
+  "the main session and a bound session get none of Alice's entries; her dashboard session does",
   { timeout: TEST_TIMEOUT_MS },
   () =>
     withPeopleGateway(PEOPLE_GATEWAY, async (gateway) => {
@@ -354,6 +360,10 @@ it(
         async (_request, response) => replyText(response, "The main-session check ran."),
         async (_request, response) => writeToolCall(response, "exec", { command }),
         async (_request, response) => replyText(response, "The dashboard check ran."),
+        async (_request, response) => writeToolCall(response, "exec", { command }),
+        async (_request, response) => replyText(response, "The bound check ran."),
+        async (_request, response) => writeToolCall(response, "exec", { command }),
+        async (_request, response) => replyText(response, "The unbound check ran."),
       );
 
       const inMain = await main.send("Alice runs the vault check in the agent's main session.");
@@ -396,6 +406,38 @@ it(
         [DENIED_HOST, "/control", undefined],
         [ALLOWED_HOST, "/allowed", `Bearer ${secretValue}`],
         [DENIED_HOST, "/control", undefined],
+      ]);
+
+      // A conversation binding routes that conversation into the session, as a plugin or a
+      // thread-bound spawn does; the real binding store answers the launch's query.
+      const bindingService = getSessionBindingService();
+      const binding = await bindingService.bind({
+        targetSessionKey: session.sessionKey,
+        targetKind: "session",
+        conversation: { channel: "webchat", accountId: "default", conversationId: randomUUID() },
+        placement: "current",
+      });
+      const inBound = await session.send("Alice runs the check while the session is bound.");
+      expect(await session.wait(inBound.runId)).toMatchObject({ status: "ok" });
+      const boundOutput = lastExec(gateway);
+      const boundStatus = await status(profileId);
+      await bindingService.unbind({ bindingId: binding.bindingId, reason: "e2e" });
+      const inUnbound = await session.send("Alice runs the check after unbinding.");
+      expect(await session.wait(inUnbound.runId)).toMatchObject({ status: "ok" });
+      const unboundOutput = lastExec(gateway);
+
+      expect(boundStatus).toBeUndefined();
+      expect(line(boundOutput, "secret-env")).toBe("");
+      expect(line(boundOutput, "plain")).toBe("absent");
+      expect(boundOutput).not.toContain("Session secrets");
+      expect(line(unboundOutput, "secret-env")).toMatch(/^oc-sent-v2\./);
+      expect(line(unboundOutput, "plain")).toBe(`present:${plainHash}`);
+      expect(origins.received.slice(5).map(({ authorization }) => authorization)).toEqual([
+        "Bearer",
+        "Bearer",
+        undefined,
+        `Bearer ${secretValue}`,
+        undefined,
       ]);
       await expectNoLeak();
     }),

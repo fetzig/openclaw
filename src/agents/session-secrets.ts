@@ -62,10 +62,19 @@ export type SessionSecretEntry = Readonly<{
   allowedHosts?: readonly string[];
 }>;
 
+/** An entry without its value: what status and the agent's list may show. */
+export type SessionSecretEntryMetadata = Readonly<{
+  name: string;
+  kind: "secret" | "env";
+  allowedHosts?: readonly string[];
+}>;
+
 /** Where entries come from: a vault plugin later; synthetic in the spike. */
 export type SessionSecretValueProvider = {
   /** Metadata only, for status and unsupported-launch warnings. */
-  listNames(profileId: string): Promise<readonly string[]> | readonly string[];
+  listNames(
+    profileId: string,
+  ): Promise<readonly SessionSecretEntryMetadata[]> | readonly SessionSecretEntryMetadata[];
   /** Values: read only at launch. */
   readEntries(
     profileId: string,
@@ -126,7 +135,7 @@ export function resolveSessionSecretsCreator(
  * under the global scope) and threads under it (Slack assistant DM threads, Telegram DM
  * topics), and every channel-peer key (DM, group or channel, threads included). Keys never
  * change, so the rule cannot drift with routing state. Conversation bindings, which can
- * point a channel at any key, are not covered.
+ * point a channel at any key, are checked separately (`isBoundToConversation`).
  */
 function isChannelRoutedSession(cfg: OpenClawConfig, target: SessionSecretsTarget): boolean {
   const agentId = agentOf(target);
@@ -144,6 +153,25 @@ function isChannelRoutedSession(cfg: OpenClawConfig, target: SessionSecretsTarge
         sessionScope: cfg.session?.scope,
       }) || deriveSessionChatTypeFromKey(sessionKey) !== "unknown"
   );
+}
+
+/**
+ * Conversation bindings route a channel conversation to any key: thread-bound subagents,
+ * plugin binds, migrated bindings. A bound session gets nothing, and so does one whose
+ * bindings cannot be listed. A binding made after a launch applies from the next launch.
+ */
+async function isBoundToConversation(target: SessionSecretsTarget): Promise<boolean> {
+  const agentId = agentOf(target);
+  try {
+    const { listSessionBindingsBySessionAsync } =
+      await import("../infra/outbound/session-binding-service.js");
+    const bindings = await listSessionBindingsBySessionAsync(
+      canonicalizeSessionKeyForAgent(agentId, target.sessionKey.trim()),
+    );
+    return bindings.length > 0;
+  } catch {
+    return true;
+  }
 }
 
 async function readSessionEntry(target: SessionSecretsTarget) {
@@ -196,8 +224,11 @@ export async function readSessionSecretsStatus(
   } finally {
     facts.release();
   }
-  const entryNames = creatorProfileId ? [...(await provider.listNames(creatorProfileId))] : [];
-  return creatorProfileId && entryNames.length > 0
+  if (!creatorProfileId || (await isBoundToConversation(target))) {
+    return undefined;
+  }
+  const entryNames = (await provider.listNames(creatorProfileId)).map((entry) => entry.name);
+  return entryNames.length > 0
     ? { creatorProfileId, entryNames: entryNames.toSorted() }
     : undefined;
 }
@@ -302,7 +333,7 @@ export async function resolveSessionSecretsLaunch(
     provider && !isChannelRoutedSession(currentConfig(), target)
       ? resolveSessionSecretsCreator(await readSessionEntry(target))
       : undefined;
-  if (!provider || !creatorProfileId) {
+  if (!provider || !creatorProfileId || (await isBoundToConversation(target))) {
     return undefined;
   }
   const unsupported = launch.sandbox ? "sandbox" : launch.durable ? "durable" : undefined;

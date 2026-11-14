@@ -133,6 +133,14 @@ vi.mock("../process/supervisor/index.js", () => ({
   getProcessSupervisor: () => ({ spawn: startupCancellationMocks.spawn }),
 }));
 
+// mock-isolation: The generic binding store runs on the Gateway's state-worker broker, which
+// vitest worker threads lack; session secrets ask it at each launch.
+vi.mock("../infra/outbound/current-conversation-bindings.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../infra/outbound/current-conversation-bindings.js")>()),
+  listGenericCurrentConversationBindingsBySessionsAsync: async (keys: readonly string[]) =>
+    keys.map(() => []),
+}));
+
 vi.mock("./shell-snapshot.js", () => ({
   maybeWrapCommandWithShellSnapshot: async (input: { command: string }) => {
     startupCancellationMocks.prepare();
@@ -1443,7 +1451,7 @@ describe("processGatewayAllowlist", () => {
       );
       let vault = [{ name: "VAULT_TEST_TOKEN", kind: "env" as const, value }];
       secrets.setSessionSecretValueProviderForTest({
-        listNames: () => vault.map((entry) => entry.name),
+        listNames: () => vault.map(({ name, kind }) => ({ name, kind })),
         readEntries: () => vault,
       });
       const operatorAuthority = (profileId: string) =>

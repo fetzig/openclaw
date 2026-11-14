@@ -13,6 +13,12 @@ import {
 } from "../config/sessions/session-accessor.js";
 import { addSessionMember } from "../config/sessions/session-sharing-store.native.js";
 import type { SessionEntry } from "../config/sessions/types.js";
+import {
+  registerSessionBindingAdapterV2,
+  unregisterSessionBindingAdapter,
+  type SessionBindingAdapterV2,
+  type SessionBindingRecord,
+} from "../infra/outbound/session-binding-service.js";
 import { isSecretValueRegisteredForRedaction } from "../logging/secret-redaction-registry.js";
 import type { SpawnInput } from "../process/supervisor/types.js";
 import type { SecretEgressSentinelBinding } from "../secrets/egress-proxy/proxy-server.js";
@@ -62,6 +68,7 @@ const mocks = vi.hoisted(() => ({
   durableInputs: [] as Array<{ env?: Record<string, string> }>,
 }));
 
+// mock-isolation: Each test installs its own plugin hooks instead of the global registry.
 vi.mock("../plugins/hook-runner-global.js", () => ({
   getGlobalHookRunner: () => mocks.hookRunner,
   getGlobalHookRunnerRegistry: () => null,
@@ -74,6 +81,13 @@ vi.mock("../infra/shell-env.js", async () =>
 vi.mock("./bash-tools.exec-host-gateway.js", async () =>
   (await import("./bash-tools.exec-env.test-support.js")).gatewayEnvironmentMock(mocks),
 );
+// mock-isolation: The generic binding store runs on the Gateway's state-worker broker, which
+// vitest worker threads lack; registered binding owners stay real, and the E2E covers the store.
+vi.mock("../infra/outbound/current-conversation-bindings.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../infra/outbound/current-conversation-bindings.js")>()),
+  listGenericCurrentConversationBindingsBySessionsAsync: async (keys: readonly string[]) =>
+    keys.map(() => []),
+}));
 // mock-isolation: Durable launches are captured instead of reaching systemd.
 vi.mock("./bash-process-durable.js", () => ({
   startDurableExecProcess: async (_session: unknown, _id: unknown, input: SpawnInput) => {
@@ -283,7 +297,11 @@ beforeEach(() => {
   setSessionSecretValueProviderForTest({
     listNames: (profileId) => {
       providerCalls.push(`listNames:${profileId}`);
-      return (vault.get(profileId) ?? []).map((entry) => entry.name);
+      return (vault.get(profileId) ?? []).map(({ name, kind = "secret", allowedHosts }) => ({
+        name,
+        kind,
+        allowedHosts,
+      }));
     },
     readEntries: (profileId) => {
       providerCalls.push(`readEntries:${profileId}`);
@@ -581,6 +599,142 @@ describe("sessions channel traffic can reach use no one's secrets", () => {
       ...Object.fromEntries(results.map(({ surfaces }, index) => [index, surfaces])),
       status,
     });
+  });
+});
+
+/**
+ * A channel's binding owner, as a thread-binding or plugin adapter registers it; tests
+ * bind and unbind sessions by editing `bindings`, or make listing fail.
+ */
+function installBindingOwner() {
+  const bindings: SessionBindingRecord[] = [];
+  const owner = { failing: false };
+  const listBySession = (key: string) => {
+    if (owner.failing) {
+      throw new Error("binding store unavailable");
+    }
+    return bindings.filter((binding) => binding.targetSessionKey === key);
+  };
+  const adapter: SessionBindingAdapterV2 = {
+    version: 2,
+    channel: "matrix",
+    accountId: "default",
+    assertCurrent: () => {},
+    listBySession,
+    listBySessionAsync: async (key) => listBySession(key),
+    resolveByConversation: () => null,
+    resolveByConversationAsync: async () => null,
+    inspectByConversationAsync: async () => null,
+    inspectByConversationsAsync: async (refs) => ({
+      bindings: refs.map(() => null),
+      assertCurrent: () => {},
+    }),
+    touchAsync: async () => {},
+  };
+  registerSessionBindingAdapterV2(adapter);
+  const bind = (targetSessionKey: string, metadata?: Record<string, unknown>) =>
+    bindings.push({
+      bindingId: `binding-${randomUUID()}`,
+      targetSessionKey,
+      targetKind: "session",
+      status: "active",
+      boundAt: Date.now(),
+      conversation: { channel: "matrix", accountId: "default", conversationId: "!room:example" },
+      ...(metadata ? { metadata } : {}),
+    });
+  return {
+    bind,
+    owner,
+    unbindAll: () => bindings.splice(0),
+    uninstall: () =>
+      unregisterSessionBindingAdapter({ channel: "matrix", accountId: "default", adapter }),
+  };
+}
+
+describe("sessions bound to a channel conversation use no one's secrets", () => {
+  let owner: ReturnType<typeof installBindingOwner>;
+  beforeEach(() => {
+    owner = installBindingOwner();
+  });
+  afterEach(() => owner.uninstall());
+
+  /** One launch per person and the status Alice sees; every result carries no value. */
+  async function probe(sessionKey: string) {
+    const results = [];
+    for (const person of ["alice", "bob", undefined] as const) {
+      results.push(await launchIn(sessionKey, person));
+    }
+    return {
+      values: results.map(({ env }) => env[KEY]),
+      warnings: results.flatMap(({ warnings }) => warnings),
+      status: await readSessionSecretsStatus(target(sessionKey), people.alice),
+      surfaces: Object.fromEntries(results.map(({ surfaces }, index) => [index, surfaces])),
+    };
+  }
+
+  it("a thread-bound subagent gets nothing while bound, and her entries again once unbound", async () => {
+    const subagent = `agent:main:subagent:${randomUUID()}`;
+    const unbound = `agent:main:subagent:${randomUUID()}`;
+    // The spawning agent acted for Alice: upstream attributes the child to her.
+    const createdActor = { type: "agent" as const, id: "main", delegatedBy: ALICE };
+    for (const sessionKey of [subagent, unbound]) {
+      await writeSession(sessionKey, { createdActor, parentSessionKey: SESSION });
+    }
+    owner.bind(subagent);
+    const whileBound = await probe(subagent);
+    const control = await probe(unbound);
+    owner.unbindAll();
+    const afterUnbind = await probe(subagent);
+
+    expect(whileBound.values).toEqual([undefined, undefined, undefined]);
+    expect(whileBound.status).toBeUndefined();
+    for (const result of [control, afterUnbind]) {
+      expect(result.values).toEqual([value, value, value]);
+      expect(result.status?.creatorProfileId).toBe(people.alice);
+    }
+    // Like a creator without entries: nothing is said.
+    expect([whileBound, control, afterUnbind].flatMap(({ warnings }) => warnings)).toEqual([]);
+    expectNoLeak({ ...whileBound.surfaces, status: whileBound.status });
+  });
+
+  it("a dashboard session a plugin bound gets nothing, sandboxed launches silently", async () => {
+    const sessionKey = await aliceSession();
+    owner.bind(sessionKey, { pluginBindingOwner: "plugin", pluginId: "example" });
+    const bound = await probe(sessionKey);
+    const sandboxed = await launch(turn("alice"), {
+      sessionKey,
+      sessionSecrets: { target: target(sessionKey) },
+      sandbox: {
+        containerName: "sandbox",
+        workspaceDir: "/workspace",
+        containerWorkdir: "/workspace",
+        buildExecSpec: async ({ env }: { env: Record<string, string> }) => ({
+          argv: ["sh", "-c", "echo ok"],
+          env,
+          stdinMode: "pipe-closed" as const,
+        }),
+      },
+    } as never);
+
+    expect(bound.values).toEqual([undefined, undefined, undefined]);
+    expect([...bound.warnings, ...sandboxed.warnings]).toEqual([]);
+    expect(bound.status).toBeUndefined();
+    expect(providerCalls).toEqual([]);
+    expectNoLeak(bound.surfaces);
+  });
+
+  it("when bindings cannot be listed, nothing is delivered and the launch still runs", async () => {
+    const sessionKey = await aliceSession();
+    owner.owner.failing = true;
+    const failing = await probe(sessionKey);
+    owner.owner.failing = false;
+    const recovered = await probe(sessionKey);
+
+    expect(failing.values).toEqual([undefined, undefined, undefined]);
+    expect(failing.warnings).toEqual([]);
+    expect(failing.status).toBeUndefined();
+    expect(recovered.values).toEqual([value, value, value]);
+    expectNoLeak(failing.surfaces);
   });
 });
 
