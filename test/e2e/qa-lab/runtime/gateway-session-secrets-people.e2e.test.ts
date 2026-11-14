@@ -387,7 +387,10 @@ it(
           storePath: target.storeScope,
         })?.createdActor,
       ).toMatchObject({ type: "human", source: "profile", id: profileId });
-      expect(await readSessionSecretsStatus(mainTarget, profileId)).toBeUndefined();
+      // Status says why; the command gets no notice.
+      expect(await readSessionSecretsStatus(mainTarget, profileId)).toEqual({
+        excluded: "main-session",
+      });
       expect(line(mainOutput, "secret-env")).toBe("");
       expect(line(mainOutput, "plain")).toBe("absent");
       expect(mainOutput).not.toContain("Session secrets");
@@ -446,7 +449,7 @@ it(
       const unboundOutput = lastExec(gateway);
       slack.uninstall();
 
-      expect(internalStatus?.creatorProfileId).toBe(profileId);
+      expect(internalStatus).toMatchObject({ creatorProfileId: profileId });
       expect(externalStatus).toBeUndefined();
       for (const output of [internalOutput, unboundOutput]) {
         expect(line(output, "secret-env")).toMatch(/^oc-sent-v2\./);
@@ -629,5 +632,132 @@ it(
       expect(line(bobIsolated, "plain")).toBe("absent");
       expect(deliveredToAllowed()).toBe(4);
       await expectNoLeak({ historyShowsProbe: false });
+    }),
+);
+
+it(
+  "sub-agents use what their parent session uses; sessions_send from main still delivers",
+  { timeout: TEST_TIMEOUT_MS },
+  () =>
+    withPeopleGateway(PEOPLE_GATEWAY, async (gateway) => {
+      const origins = await startOrigins(gateway.home);
+      const { plainHash, secretValue, session, target, profileId, expectNoLeak } =
+        await prepare(gateway);
+      const main = gateway.session("agent:main:main");
+      const command = probe(origins);
+      type Turn = Parameters<typeof gateway.model.script>[number];
+      const reply =
+        (text: string): Turn =>
+        async (_request, response) =>
+          replyText(response, text);
+      const exec: Turn = async (_request, response) => writeToolCall(response, "exec", { command });
+      const outputs: Record<string, string> = {};
+      const children: Record<string, string> = {};
+      /** Records the exec output this conversation just received, then replies. */
+      const recordExec =
+        (name: string): Turn =>
+        async (request, response) => {
+          outputs[name] = execOutputs({ requests: () => [request] }).at(-1)!;
+          replyText(response, `${name} check ran.`);
+        };
+      const task = (name: string) => `Vault child ${name}: run the vault check.`;
+      const spawn =
+        (name: string): Turn =>
+        async (_request, response) =>
+          writeToolCall(response, "sessions_spawn", { task: task(name), mode: "run" });
+      const recordSpawn =
+        (name: string): Turn =>
+        async (request, response) => {
+          const result = JSON.parse(
+            request.input.findLast((item) => item.type === "function_call_output")?.output ??
+              "null",
+          ) as { childSessionKey?: string } | null;
+          children[name] = result?.childSessionKey ?? "";
+          replyText(response, `Delegated ${name}.`);
+        };
+      // Each conversation answers from its own queue; a marker in every message picks it.
+      gateway.model.route(
+        "[alice-session]",
+        reply("Session created."),
+        spawn("bob"),
+        recordSpawn("bob"),
+        reply("Bob's sub-agent reported."),
+        // The message main sends with sessions_send runs a turn here.
+        exec,
+        recordExec("sent from main"),
+      );
+      gateway.model.route(
+        "[main-session]",
+        spawn("main"),
+        recordSpawn("main"),
+        reply("Main's sub-agent reported."),
+        async (_request, response) =>
+          writeToolCall(response, "sessions_send", {
+            sessionKey: session.sessionKey,
+            message: "[alice-session] A note from the main session: run the vault check.",
+            timeoutSeconds: 0,
+          }),
+        reply("Sent the note."),
+        reply("Main read the reply."),
+      );
+      gateway.model.route(task("bob"), exec, recordExec("Bob's sub-agent"));
+      gateway.model.route(task("main"), exec, recordExec("main's sub-agent"));
+
+      const created = await session.send("[alice-session] Alice opens the session.");
+      expect(await session.wait(created.runId)).toMatchObject({ status: "ok" });
+      await gateway.alice.request("session.visibility.set", {
+        sessionKey: session.sessionKey,
+        visibility: "shared",
+      });
+      const bob = await gateway.connectAs(BOB);
+      const bobRun = await session.send("[alice-session] Bob delegates the vault check.", bob);
+      expect(await session.wait(bobRun.runId)).toMatchObject({ status: "ok" });
+      expect(
+        await session.wait(await session.finalReply("Bob's sub-agent reported.")),
+      ).toMatchObject({ status: "ok" });
+
+      const mainRun = await main.send("[main-session] Alice delegates from the main session.");
+      expect(await main.wait(mainRun.runId)).toMatchObject({ status: "ok" });
+      expect(await main.wait(await main.finalReply("Main's sub-agent reported."))).toMatchObject({
+        status: "ok",
+      });
+
+      const sendRun = await main.send("[main-session] Alice asks her session from main.");
+      expect(await main.wait(sendRun.runId)).toMatchObject({ status: "ok" });
+      expect(await main.wait(await main.finalReply("Main read the reply."))).toMatchObject({
+        status: "ok",
+      });
+
+      // Upstream attributes Bob's sub-agent to Bob; its secrets still come from Alice's session.
+      const childEntry = (sessionKey: string) =>
+        loadSessionEntry({ agentId: "main", sessionKey, storePath: target.storeScope });
+      const { profile: bobProfile } = await bob.request<{ profile: { id: string } }>(
+        "users.self",
+        {},
+      );
+      expect(childEntry(children.bob!)).toMatchObject({
+        spawnedBy: session.sessionKey,
+        createdActor: { delegatedBy: { source: "profile", id: bobProfile.id } },
+      });
+      expect(childEntry(children.main!)).toMatchObject({ spawnedBy: main.sessionKey });
+      const childStatus = (name: string) =>
+        readSessionSecretsStatus({ ...target, sessionKey: children[name]! }, profileId);
+      expect(await childStatus("bob")).toEqual({
+        creatorProfileId: profileId,
+        entryNames: [PLAIN, SECRET],
+      });
+      expect(await childStatus("main")).toEqual({ excluded: "inherited", from: main.sessionKey });
+
+      for (const name of ["Bob's sub-agent", "sent from main"]) {
+        expect(line(outputs[name]!, "secret-env"), name).toMatch(/^oc-sent-v2\./);
+        expect(line(outputs[name]!, "plain"), name).toBe(`present:${plainHash}`);
+      }
+      expect(line(outputs["main's sub-agent"]!, "secret-env")).toBe("");
+      expect(line(outputs["main's sub-agent"]!, "plain")).toBe("absent");
+      expect(outputs["main's sub-agent"]).not.toContain("Session secrets");
+      expect(
+        origins.received.filter((request) => request.authorization === `Bearer ${secretValue}`),
+      ).toHaveLength(2);
+      await expectNoLeak();
     }),
 );

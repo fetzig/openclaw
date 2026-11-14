@@ -13,6 +13,7 @@ import { GATEWAY_OWNER_PROFILE_ID } from "../../packages/gateway-protocol/src/sc
 import { getRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { resolveCanonicalMainSessionKey } from "../config/sessions/main-session-key.js";
 import { canonicalizeMainSessionAlias } from "../config/sessions/main-session.js";
+import { resolveSessionStorePathCore } from "../config/sessions/paths.js";
 import { sessionCreatorProfileId } from "../config/sessions/session-entry-provenance.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -40,7 +41,7 @@ import {
   getSessionControllerEntryForOperation,
   isCurrentSessionControllerOperation,
 } from "../sessions/session-controller.identity.js";
-import { parseThreadSessionSuffix } from "../sessions/session-key-utils.js";
+import { parseAgentSessionKey, parseThreadSessionSuffix } from "../sessions/session-key-utils.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { readResidentUserProfileIdentity } from "../state/user-profile-list.js";
 import { isInternalMessageChannel } from "../utils/message-channel.js";
@@ -136,7 +137,10 @@ export function resolveSessionSecretsCreator(
  * change, so the rule cannot drift with routing state. Conversation bindings, which can
  * point a channel at any key, are checked separately (`isBoundToConversation`).
  */
-function isChannelRoutedSession(cfg: OpenClawConfig, target: SessionSecretsTarget): boolean {
+function channelKeyExclusion(
+  cfg: OpenClawConfig,
+  target: SessionSecretsTarget,
+): "main-session" | "channel-session" | undefined {
   const agentId = agentOf(target);
   const sessionKey = canonicalizeSessionKeyForAgent(agentId, target.sessionKey.trim());
   const base = canonicalizeMainSessionAlias({
@@ -144,14 +148,81 @@ function isChannelRoutedSession(cfg: OpenClawConfig, target: SessionSecretsTarge
     agentId,
     sessionKey: parseThreadSessionSuffix(sessionKey).baseSessionKey ?? sessionKey,
   });
-  return (
+  if (
     base ===
-      resolveCanonicalMainSessionKey({
-        agentId,
-        mainKey: cfg.session?.mainKey,
-        sessionScope: cfg.session?.scope,
-      }) || deriveSessionChatTypeFromKey(sessionKey) !== "unknown"
-  );
+    resolveCanonicalMainSessionKey({
+      agentId,
+      mainKey: cfg.session?.mainKey,
+      sessionScope: cfg.session?.scope,
+    })
+  ) {
+    return "main-session";
+  }
+  return deriveSessionChatTypeFromKey(sessionKey) !== "unknown" ? "channel-session" : undefined;
+}
+
+/** Why a session uses no one's secrets by its key, or by an ancestor's in its spawn chain. */
+export type SessionSecretsExclusion = Readonly<{
+  excluded: "main-session" | "channel-session" | "inherited";
+  /** For "inherited": the ancestor whose key is excluded. */
+  from?: string;
+}>;
+
+type SessionSecretsSource = Readonly<{ creatorProfileId: string }> | SessionSecretsExclusion;
+
+/** Spawn depth is capped at 5 (`maxSpawnDepth`); a longer chain is malformed. */
+const MAX_SPAWN_HOPS = 16;
+
+/**
+ * Whose secrets a session uses. A spawned session (`spawnedBy`, set only by agent spawns:
+ * sub-agents, visible spawns, ACP, voice consults) uses what its parent uses, up the chain,
+ * whoever's turn spawned it; any other session uses its own creator. Every hop applies its
+ * own key exclusion, and a delivering hop its own binding check. An unreadable parent, a
+ * cycle or an overlong chain yields nothing. `parentSessionKey` is not followed: people's
+ * own New Chat, child, fork and default dashboard roots carry it too.
+ */
+async function resolveSessionSecretsSource(
+  cfg: OpenClawConfig,
+  target: SessionSecretsTarget,
+  seen = new Set<string>(),
+): Promise<SessionSecretsSource | undefined> {
+  const agentId = agentOf(target);
+  const sessionKey = canonicalizeSessionKeyForAgent(agentId, target.sessionKey.trim());
+  const id = `${target.storeScope}\0${sessionKey}`;
+  if (seen.has(id) || seen.size > MAX_SPAWN_HOPS) {
+    return undefined;
+  }
+  seen.add(id);
+  const excluded = channelKeyExclusion(cfg, target);
+  if (excluded) {
+    return { excluded };
+  }
+  const entry = await readSessionEntry(target).catch(() => undefined);
+  const spawnedBy = entry?.spawnedBy?.trim();
+  let source: SessionSecretsSource | undefined;
+  if (spawnedBy) {
+    // Spawns may cross agents; the parent then lives in its own agent's configured store.
+    const parentAgentId = normalizeAgentId(parseAgentSessionKey(spawnedBy)?.agentId ?? agentId);
+    const parent = {
+      storeScope:
+        parentAgentId === agentId
+          ? target.storeScope
+          : resolveSessionStorePathCore(cfg.session?.store, { agentId: parentAgentId }),
+      agentId: parentAgentId,
+      sessionKey: canonicalizeSessionKeyForAgent(parentAgentId, spawnedBy),
+    };
+    source = await resolveSessionSecretsSource(cfg, parent, seen);
+    if (source && "excluded" in source) {
+      source = { excluded: "inherited", from: source.from ?? parent.sessionKey };
+    }
+  } else {
+    const creatorProfileId = resolveSessionSecretsCreator(entry);
+    source = creatorProfileId ? { creatorProfileId } : undefined;
+  }
+  // Bound sessions stay silent: no reason, as for a creator without entries.
+  return source && "creatorProfileId" in source && (await isBoundToConversation(target))
+    ? undefined
+    : source;
 }
 
 /**
@@ -187,21 +258,21 @@ async function readSessionEntry(target: SessionSecretsTarget) {
 
 /**
  * Read-only status for one session participant: whose secrets the session uses and their
- * names, never values. Undefined when the requester cannot see the session (the sharing
- * owner's read check) or the creator has no entries.
+ * names, never values, or why a main, channel or inherited-exclusion session uses none.
+ * Undefined when the requester cannot see the session (the sharing owner's read check),
+ * the session is bound to a channel conversation, or the creator has no entries.
  */
 export async function readSessionSecretsStatus(
   target: SessionSecretsTarget,
   requesterProfileId: string,
-): Promise<{ creatorProfileId: string; entryNames: string[] } | undefined> {
+): Promise<
+  { creatorProfileId: string; entryNames: string[] } | SessionSecretsExclusion | undefined
+> {
   const provider = state.provider;
   if (!provider) {
     return undefined;
   }
   const cfg = currentConfig();
-  if (isChannelRoutedSession(cfg, target)) {
-    return undefined;
-  }
   const agentId = agentOf(target);
   const sessionKey = canonicalizeSessionKeyForAgent(agentId, target.sessionKey.trim());
   const facts = await prepareSessionMutationFacts({ cfg, agentId, sessionKey }).catch(
@@ -210,7 +281,6 @@ export async function readSessionSecretsStatus(
   if (!facts) {
     return undefined;
   }
-  let creatorProfileId: string | undefined;
   try {
     const { target: session, membership } = facts.readCurrent(cfg);
     const client = createSyntheticPluginRuntimeClient({
@@ -221,13 +291,14 @@ export async function readSessionSecretsStatus(
     if (visible?.(sessionKey, session.entry, membership.has(requesterProfileId)) === false) {
       return undefined;
     }
-    creatorProfileId = resolveSessionSecretsCreator(session.entry);
   } finally {
     facts.release();
   }
-  if (!creatorProfileId || (await isBoundToConversation(target))) {
-    return undefined;
+  const source = await resolveSessionSecretsSource(cfg, target);
+  if (!source || "excluded" in source) {
+    return source;
   }
+  const { creatorProfileId } = source;
   const entryNames = (await provider.listNames(creatorProfileId)).map((entry) => entry.name);
   return entryNames.length > 0
     ? { creatorProfileId, entryNames: entryNames.toSorted() }
@@ -337,11 +408,9 @@ export async function resolveSessionSecretsLaunch(
   }
   const provider = state.provider;
   // Checked before anything is read: like a creator without entries, silently nothing.
-  const creatorProfileId =
-    provider && !isChannelRoutedSession(currentConfig(), target)
-      ? resolveSessionSecretsCreator(await readSessionEntry(target))
-      : undefined;
-  if (!provider || !creatorProfileId || (await isBoundToConversation(target))) {
+  const source = provider ? await resolveSessionSecretsSource(currentConfig(), target) : undefined;
+  const creatorProfileId = source && "creatorProfileId" in source ? source.creatorProfileId : "";
+  if (!provider || !creatorProfileId) {
     return undefined;
   }
   const unsupported = launch.sandbox ? "sandbox" : launch.durable ? "durable" : undefined;

@@ -13,12 +13,6 @@ import {
 } from "../config/sessions/session-accessor.js";
 import { addSessionMember } from "../config/sessions/session-sharing-store.native.js";
 import type { SessionEntry } from "../config/sessions/types.js";
-import {
-  registerSessionBindingAdapterV2,
-  unregisterSessionBindingAdapter,
-  type SessionBindingAdapterV2,
-  type SessionBindingRecord,
-} from "../infra/outbound/session-binding-service.js";
 import { isSecretValueRegisteredForRedaction } from "../logging/secret-redaction-registry.js";
 import type { SpawnInput } from "../process/supervisor/types.js";
 import type { SecretEgressSentinelBinding } from "../secrets/egress-proxy/proxy-server.js";
@@ -46,6 +40,10 @@ import type { CapturedEnvironment } from "./bash-tools.exec-env.test-support.js"
 import { runExecFixture } from "./bash-tools.exec-fixture.test-support.js";
 import { runtimeManagedRun } from "./bash-tools.exec-runtime.test-support.js";
 import type { ExecToolDefaults } from "./bash-tools.exec-types.js";
+import {
+  installBindingOwner,
+  sandboxBackend as sandbox,
+} from "./bash-tools.exec.session-secrets.test-support.js";
 import { createOperationalRunInstanceRef } from "./operational-run-instance.js";
 import {
   readSessionSecretsStatus,
@@ -369,7 +367,7 @@ describe("whose secrets a session uses", () => {
       () => ({ createdActor: ALICE, createdVia: "cron", parentSessionKey: SESSION }),
       "alice",
     ],
-    // The parent's creator never leaks into a session someone else created.
+    // parentSessionKey alone is no spawn: people's own New Chat, child and fork carry it.
     [
       "a child Bob created under Alice's session",
       () => ({ createdActor: human(people.bob), parentSessionKey: SESSION }),
@@ -452,6 +450,19 @@ async function aliceSession(fields: Partial<SessionEntry> = {}) {
 }
 const launchIn = (sessionKey: string, person: keyof typeof people | undefined) =>
   launch(turn(person), { sessionKey, sessionSecrets: { target: target(sessionKey) } });
+/** Launches by Alice, Bob and no person, and the status Alice sees. */
+async function probe(sessionKey: string) {
+  const results = [];
+  for (const person of ["alice", "bob", undefined] as const) {
+    results.push(await launchIn(sessionKey, person));
+  }
+  return {
+    values: results.map(({ env }) => env[KEY]),
+    warnings: results.flatMap(({ warnings }) => warnings),
+    status: await readSessionSecretsStatus(target(sessionKey), people.alice),
+    surfaces: Object.fromEntries(results.map(({ surfaces }, index) => [index, surfaces])),
+  };
+}
 const addMember = (sessionKey: string, person: keyof typeof people) =>
   addSessionMember(
     { agentId: AGENT, sessionKey, storePath: store },
@@ -539,60 +550,69 @@ describe("the creator's vault is the switch", () => {
 describe("sessions channel traffic can reach use no one's secrets", () => {
   afterEach(() => clearRuntimeConfigSnapshot());
 
-  const sandbox = {
-    containerName: "sandbox",
-    workspaceDir: "/workspace",
-    containerWorkdir: "/workspace",
-    buildExecSpec: async ({ env }: { env: Record<string, string> }) => ({
-      argv: ["sh", "-c", "echo ok"],
-      env,
-      stdinMode: "pipe-closed" as const,
-    }),
-  };
-
-  it.each<[string, string, { mainKey?: string } | undefined, boolean]>([
+  const MAIN = "main-session";
+  const CHANNEL = "channel-session";
+  it.each<[string, string, { mainKey?: string } | undefined, string | undefined]>([
     // Alice sent the first message in each of these; DMs or groups can still land there.
-    ["the agent's main session", "agent:main:main", undefined, false],
-    ["the main session under a custom mainKey", "agent:main:work", { mainKey: "work" }, false],
+    ["the agent's main session", "agent:main:main", undefined, MAIN],
+    // Own agents: one store with both main rows needs a doctor migration under mainKey "work".
+    ["the main session under a custom mainKey", "agent:work1:work", { mainKey: "work" }, MAIN],
     // The upstream main alias stays the main session when mainKey changes.
-    ["the main alias under a custom mainKey", "agent:main:main", { mainKey: "work" }, false],
+    ["the main alias under a custom mainKey", "agent:work2:main", { mainKey: "work" }, MAIN],
     // Slack Assistant DM threads and Telegram DM topics thread under the main session.
     [
       "a thread under the main session",
       "agent:main:work:thread:1700000000.000100",
       { mainKey: "work" },
-      false,
+      MAIN,
     ],
-    ["a per-peer DM", "agent:main:direct:+15550001", undefined, false],
-    ["a per-channel-peer DM", "agent:main:whatsapp:direct:+15550001", undefined, false],
-    ["a per-account DM", "agent:main:telegram:default:direct:12345", undefined, false],
-    ["a group", "agent:main:whatsapp:group:120363@g.us", undefined, false],
-    ["a bound thread", "agent:main:slack:channel:c0123:thread:1700000000.000100", undefined, false],
+    ["a per-peer DM", "agent:main:direct:+15550001", undefined, CHANNEL],
+    ["a per-channel-peer DM", "agent:main:whatsapp:direct:+15550001", undefined, CHANNEL],
+    ["a per-account DM", "agent:main:telegram:default:direct:12345", undefined, CHANNEL],
+    ["a group", "agent:main:whatsapp:group:120363@g.us", undefined, CHANNEL],
+    [
+      "a bound thread",
+      "agent:main:slack:channel:c0123:thread:1700000000.000100",
+      undefined,
+      CHANNEL,
+    ],
     // Controls: ordinary sessions still deliver, and only the configured main key is main.
-    ["Alice's dashboard session", "agent:main:dashboard:control", undefined, true],
-    ["a session named like a custom mainKey", "agent:main:work", undefined, true],
+    ["Alice's dashboard session", "agent:main:dashboard:control", undefined, undefined],
+    ["a session named like a custom mainKey", "agent:main:work", undefined, undefined],
     [
       "the dashboard under a custom mainKey",
       "agent:main:dashboard:control",
       { mainKey: "work" },
-      true,
+      undefined,
     ],
-  ])("%s", async (_label, sessionKey, session, delivers) => {
+  ])("%s", async (_label, sessionKey, session, excluded) => {
+    const delivers = !excluded;
     if (session) {
       setRuntimeConfigSnapshot({ session });
     }
-    await writeSession(sessionKey, { createdActor: ALICE });
+    const agentId = sessionKey.split(":")[1]!;
+    const where = {
+      storeScope: resolveSessionStorePathCore(undefined, { agentId }),
+      agentId,
+      sessionKey,
+    };
+    // A Gateway persists the main alias under the configured mainKey.
+    const storedKey = session?.mainKey
+      ? sessionKey.replace(/:main$/, `:${session.mainKey}`)
+      : sessionKey;
+    await replaceSessionEntry(
+      { agentId, sessionKey: storedKey, storePath: where.storeScope },
+      { sessionId: SESSION_ID, updatedAt: Date.now(), createdActor: ALICE },
+    );
+    const launchAs = (person: keyof typeof people | undefined, extra = {}) =>
+      launch(turn(person, agentId), { sessionKey, sessionSecrets: { target: where }, ...extra });
     const results = [];
     for (const person of ["alice", "bob", undefined] as const) {
-      results.push(await launchIn(sessionKey, person));
+      results.push(await launchAs(person));
     }
     // Unsupported launches stay silent there too: nothing was withheld.
-    const sandboxed = await launch(turn("alice"), {
-      sessionKey,
-      sessionSecrets: { target: target(sessionKey) },
-      sandbox,
-    } as never);
-    const status = await readSessionSecretsStatus(target(sessionKey), people.alice);
+    const sandboxed = await launchAs("alice", { sandbox });
+    const status = await readSessionSecretsStatus(where, people.alice);
 
     expect(results.map(({ env }) => env[KEY])).toEqual(
       results.map(() => (delivers ? value : undefined)),
@@ -603,7 +623,10 @@ describe("sessions channel traffic can reach use no one's secrets", () => {
         ? [`Session secrets were not provided to this command: sandbox exec is not supported.`]
         : [],
     );
-    expect(status?.creatorProfileId).toBe(delivers ? people.alice : undefined);
+    // Status says why; commands get no notice.
+    expect(status).toEqual(
+      delivers ? { creatorProfileId: people.alice, entryNames: [KEY] } : { excluded },
+    );
     if (!delivers) {
       // Refused before anything is read, as for a creator without entries.
       expect(providerCalls).toEqual([]);
@@ -615,56 +638,103 @@ describe("sessions channel traffic can reach use no one's secrets", () => {
   });
 });
 
-/**
- * A channel's binding owner, as a thread-binding or plugin adapter registers it; tests
- * bind and unbind sessions by editing `bindings`, or make listing fail.
- */
-function installBindingOwner() {
-  const bindings: SessionBindingRecord[] = [];
-  const owner = { failing: false };
-  const listBySession = (key: string) => {
-    if (owner.failing) {
-      throw new Error("binding store unavailable");
+describe("spawned sessions use what their parent session uses", () => {
+  /** A sub-agent spawned in `parent` by Bob's turn: upstream attributes it to Bob. */
+  async function spawnIn(parent: string, store_ = store, agentId = AGENT) {
+    const sessionKey = `agent:${agentId}:subagent:${randomUUID()}`;
+    await replaceSessionEntry(
+      { agentId, sessionKey, storePath: store_ },
+      {
+        sessionId: SESSION_ID,
+        updatedAt: Date.now(),
+        createdActor: { type: "agent", id: agentId, delegatedBy: human(people.bob) },
+        spawnedBy: parent,
+        parentSessionKey: parent,
+      },
+    );
+    return sessionKey;
+  }
+
+  beforeEach(() => {
+    // Bob has entries too: a child that used its own creator would get his.
+    vault.set(people.bob, [{ name: KEY, kind: "env", value: `bob-${value}` }]);
+  });
+
+  it("a sub-agent and its sub-agent spawned by Bob's turns in Alice's session use hers", async () => {
+    const aliceKey = await aliceSession({ visibility: "shared" });
+    const child = await spawnIn(aliceKey);
+    const grandchild = await spawnIn(child);
+    const results = { child: await probe(child), grandchild: await probe(grandchild) };
+
+    for (const result of Object.values(results)) {
+      expect(result.values).toEqual([value, value, value]);
+      expect(result.status).toEqual({ creatorProfileId: people.alice, entryNames: [KEY] });
+      expect(result.warnings).toEqual([]);
+      expectNoLeak(result.surfaces);
     }
-    return bindings.filter((binding) => binding.targetSessionKey === key);
-  };
-  const adapter: SessionBindingAdapterV2 = {
-    version: 2,
-    channel: "matrix",
-    accountId: "default",
-    assertCurrent: () => {},
-    listBySession,
-    listBySessionAsync: async (key) => listBySession(key),
-    resolveByConversation: () => null,
-    resolveByConversationAsync: async () => null,
-    inspectByConversationAsync: async () => null,
-    inspectByConversationsAsync: async (refs) => ({
-      bindings: refs.map(() => null),
-      assertCurrent: () => {},
-    }),
-    touchAsync: async () => {},
-  };
-  registerSessionBindingAdapterV2(adapter);
-  // In a Gateway, internal-channel bindings live in the generic store (mocked here); the
-  // service merges every owner's records, so this owner can stand in for either.
-  const bind = (targetSessionKey: string, metadata?: Record<string, unknown>, channel = "matrix") =>
-    bindings.push({
-      bindingId: `binding-${randomUUID()}`,
-      targetSessionKey,
-      targetKind: "session",
-      status: "active",
-      boundAt: Date.now(),
-      conversation: { channel, accountId: "default", conversationId: `${channel}-${randomUUID()}` },
-      ...(metadata ? { metadata } : {}),
+  });
+
+  it("a sub-agent in another agent reads its parent from that agent's store", async () => {
+    // The child runs as agent "coder"; its parent is Alice's session of agent "main".
+    const aliceKey = await aliceSession();
+    const coderStore = resolveSessionStorePathCore(undefined, { agentId: "coder" });
+    const child = await spawnIn(aliceKey, coderStore, "coder");
+    const coderTarget = { storeScope: coderStore, agentId: "coder", sessionKey: child };
+    const { env, surfaces } = await launch(turn("bob", "coder"), {
+      sessionKey: child,
+      sessionSecrets: { target: coderTarget },
     });
-  return {
-    bind,
-    owner,
-    unbindAll: () => bindings.splice(0),
-    uninstall: () =>
-      unregisterSessionBindingAdapter({ channel: "matrix", accountId: "default", adapter }),
-  };
-}
+    expect(env[KEY]).toBe(value);
+    expectNoLeak(surfaces);
+  });
+
+  it.each<[string, string, string]>([
+    ["the main session", "agent:main:main", "main-session"],
+    ["a channel DM", "agent:main:whatsapp:direct:+15550001", "channel-session"],
+  ])("children of %s get nothing, and status says why", async (_label, parent, reason) => {
+    // Alice created the parent herself; only its key excludes it.
+    await writeSession(parent, { createdActor: ALICE });
+    const child = await spawnIn(parent);
+    const grandchild = await spawnIn(child);
+    const parentStatus = await readSessionSecretsStatus(target(parent), people.alice);
+    const results = { child: await probe(child), grandchild: await probe(grandchild) };
+    const sandboxed = await launch(turn("alice"), {
+      sessionKey: child,
+      sessionSecrets: { target: target(child) },
+      sandbox,
+    } as never);
+
+    expect(parentStatus).toEqual({ excluded: reason });
+    for (const result of Object.values(results)) {
+      expect(result.values).toEqual([undefined, undefined, undefined]);
+      expect(result.status).toEqual({ excluded: "inherited", from: parent });
+      expectNoLeak(result.surfaces);
+    }
+    // No notice on exec, sandboxed or not, and nothing was read.
+    expect([...results.child.warnings, ...results.grandchild.warnings]).toEqual([]);
+    expect(sandboxed.warnings).toEqual([]);
+    expect(providerCalls).toEqual([]);
+  });
+
+  it("an unreadable parent, a cycle or a parent without a person give nothing", async () => {
+    const deleted = await spawnIn(`agent:main:dashboard:deleted-${randomUUID()}`);
+    // The parent's agent has no such session in its store.
+    const elsewhere = await spawnIn(`agent:coder:dashboard:${randomUUID()}`);
+    const loopA = `agent:main:subagent:${randomUUID()}`;
+    const loopB = await spawnIn(loopA);
+    await writeSession(loopA, { createdActor: ALICE, spawnedBy: loopB });
+    const agentParent = `agent:main:dashboard:${randomUUID()}`;
+    await writeSession(agentParent, { createdActor: { type: "agent", id: "main" } });
+    const orphan = await spawnIn(agentParent);
+
+    for (const sessionKey of [deleted, elsewhere, loopA, loopB, orphan]) {
+      const result = await probe(sessionKey);
+      expect(result.values, sessionKey).toEqual([undefined, undefined, undefined]);
+      expect(result.status, sessionKey).toBeUndefined();
+      expect(result.warnings, sessionKey).toEqual([]);
+    }
+  });
+});
 
 describe("sessions bound to a channel conversation use no one's secrets", () => {
   let owner: ReturnType<typeof installBindingOwner>;
@@ -673,27 +743,17 @@ describe("sessions bound to a channel conversation use no one's secrets", () => 
   });
   afterEach(() => owner.uninstall());
 
-  /** One launch per person and the status Alice sees; every result carries no value. */
-  async function probe(sessionKey: string) {
-    const results = [];
-    for (const person of ["alice", "bob", undefined] as const) {
-      results.push(await launchIn(sessionKey, person));
-    }
-    return {
-      values: results.map(({ env }) => env[KEY]),
-      warnings: results.flatMap(({ warnings }) => warnings),
-      status: await readSessionSecretsStatus(target(sessionKey), people.alice),
-      surfaces: Object.fromEntries(results.map(({ surfaces }, index) => [index, surfaces])),
-    };
-  }
-
   it("a thread-bound subagent gets nothing while bound, and her entries again once unbound", async () => {
     const subagent = `agent:main:subagent:${randomUUID()}`;
     const unbound = `agent:main:subagent:${randomUUID()}`;
-    // The spawning agent acted for Alice: upstream attributes the child to her.
+    // Spawned in Alice's session, so they inherit her entries.
     const createdActor = { type: "agent" as const, id: "main", delegatedBy: ALICE };
     for (const sessionKey of [subagent, unbound]) {
-      await writeSession(sessionKey, { createdActor, parentSessionKey: SESSION });
+      await writeSession(sessionKey, {
+        createdActor,
+        spawnedBy: SESSION,
+        parentSessionKey: SESSION,
+      });
     }
     owner.bind(subagent);
     const whileBound = await probe(subagent);
@@ -705,11 +765,26 @@ describe("sessions bound to a channel conversation use no one's secrets", () => 
     expect(whileBound.status).toBeUndefined();
     for (const result of [control, afterUnbind]) {
       expect(result.values).toEqual([value, value, value]);
-      expect(result.status?.creatorProfileId).toBe(people.alice);
+      expect(result.status).toMatchObject({ creatorProfileId: people.alice });
     }
     // Like a creator without entries: nothing is said.
     expect([whileBound, control, afterUnbind].flatMap(({ warnings }) => warnings)).toEqual([]);
     expectNoLeak({ ...whileBound.surfaces, status: whileBound.status });
+  });
+
+  it("a sub-agent of a bound session gets nothing, silently", async () => {
+    const parent = await aliceSession();
+    const child = `agent:main:subagent:${randomUUID()}`;
+    await writeSession(child, {
+      createdActor: { type: "agent", id: "main", delegatedBy: ALICE },
+      spawnedBy: parent,
+    });
+    owner.bind(parent, undefined, "slack");
+    const result = await probe(child);
+    expect(result.values).toEqual([undefined, undefined, undefined]);
+    expect(result.status).toBeUndefined();
+    expect(result.warnings).toEqual([]);
+    expectNoLeak(result.surfaces);
   });
 
   it("a binding to the internal channel alone does not count; one external binding does", async () => {
@@ -723,7 +798,7 @@ describe("sessions bound to a channel conversation use no one's secrets", () => 
     const withExternal = await probe(both);
 
     expect(internalOnly.values).toEqual([value, value, value]);
-    expect(internalOnly.status?.creatorProfileId).toBe(people.alice);
+    expect(internalOnly.status).toMatchObject({ creatorProfileId: people.alice });
     expect(withExternal.values).toEqual([undefined, undefined, undefined]);
     expect(withExternal.status).toBeUndefined();
     expect([...internalOnly.warnings, ...withExternal.warnings]).toEqual([]);
@@ -737,16 +812,7 @@ describe("sessions bound to a channel conversation use no one's secrets", () => 
     const sandboxed = await launch(turn("alice"), {
       sessionKey,
       sessionSecrets: { target: target(sessionKey) },
-      sandbox: {
-        containerName: "sandbox",
-        workspaceDir: "/workspace",
-        containerWorkdir: "/workspace",
-        buildExecSpec: async ({ env }: { env: Record<string, string> }) => ({
-          argv: ["sh", "-c", "echo ok"],
-          env,
-          stdinMode: "pipe-closed" as const,
-        }),
-      },
+      sandbox,
     } as never);
 
     expect(bound.values).toEqual([undefined, undefined, undefined]);
