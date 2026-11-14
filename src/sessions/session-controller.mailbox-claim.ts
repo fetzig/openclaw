@@ -12,7 +12,6 @@ import type {
 import {
   retireSessionControllerInput,
   settleSessionControllerSourceInjectionOrder,
-  tripRequesterGrantBreaker,
 } from "./session-controller.mailbox-source.js";
 import { waitForReplyOperationSourceRelease } from "./session-controller.settlement.js";
 import {
@@ -84,7 +83,6 @@ export function attachSessionControllerInputOperation(
   settleSessionControllerSourceInjectionOrder(input, false);
   input.claim = claim;
   input.phase = "claimed";
-  tripRequesterGrantBreaker(input);
 }
 
 /** The execution producer alone reports a closed, pre-execution refusal.

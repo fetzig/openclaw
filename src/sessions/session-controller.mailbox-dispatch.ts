@@ -38,7 +38,6 @@ import { captureSessionControllerMailboxSummarySources as summaryCandidates } fr
 import {
   settleSessionControllerSourceInjectionOrder,
   retireSessionControllerInput,
-  tripRequesterGrantBreaker,
 } from "./session-controller.mailbox-source.js";
 import { sessionControllers, pruneSessionControllerEntry } from "./session-controller.state.js";
 
@@ -287,7 +286,6 @@ function claimSessionControllerMailboxSelection(
     settleSessionControllerSourceInjectionOrder(input, false);
     input.phase = "claimed";
     input.claim = claim;
-    tripRequesterGrantBreaker(input);
     logSessionControllerSourceClaim(input, "selected");
   }
   notifyGatewayWorkMetricsChanged();

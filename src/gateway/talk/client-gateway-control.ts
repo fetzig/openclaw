@@ -348,7 +348,7 @@ export function createTalkClientGatewayControlOwner(
             sessionKey: params.sessionTarget.canonicalKey,
             agentId: params.sessionTarget.agentId,
           }),
-          adapter: { signal: controller.signal, humanIngress: true },
+          adapter: { signal: controller.signal },
         });
         // Provider callbacks can arrive outside the originating RPC's async scope.
         bindGatewayContextResolver(input, params.context.resolveGatewayContext);

@@ -2,11 +2,6 @@ import { setImmediate as drainContinuations } from "node:timers/promises";
 import { expect, it, vi } from "vitest";
 import { buildEmbeddedRunExecutionParams } from "../../auto-reply/reply/agent-runner-utils.js";
 import { createTestFollowupRun } from "../../auto-reply/reply/agent-runner.test-fixtures.js";
-import { createQueueTestRun } from "../../auto-reply/reply/queue.test-helpers.js";
-import {
-  bindReplySourceToFollowup,
-  prepareReplySourceInput,
-} from "../../auto-reply/reply/reply-source-binding.js";
 import { resolveVisibleActiveSessionRunState } from "../../gateway/server-methods/session-active-runs.js";
 import { PluginInstance } from "../../plugins/plugin-instance.js";
 import { PluginInvocationScope } from "../../plugins/plugin-invocation-scope.js";
@@ -25,18 +20,8 @@ import { createPluginRecord } from "../../plugins/status.test-helpers.js";
 import { withSessionTurn } from "../../sessions/session-controller.admission.js";
 import type { ReplyOperation } from "../../sessions/session-controller.contracts.js";
 import { isCurrentSessionControllerOperation } from "../../sessions/session-controller.identity.js";
-import {
-  claimSessionControllerInput,
-  releaseSessionControllerClaim,
-} from "../../sessions/session-controller.mailbox.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
-import { createAdmittedRunOperatorAuthority } from "../admitted-run-context.js";
-import {
-  enableRequesterGrantForTest,
-  readRequesterGrantHoldersForTest,
-  resetRequesterGrantsForTest,
-} from "../requester-grants.js";
 import { waitForSessionMaintenance } from "./coordinator.js";
 import { createSessionMaintenanceFollowup, scheduleSessionMaintenance } from "./run.js";
 import { blockFlush, expectEffects, memory, setup } from "./run.test-support.js";
@@ -196,52 +181,3 @@ it("admits maintenance on its Gateway successor after the foreground plugin scop
     }
   });
 });
-
-it("leaves a full-session exec grant intact: maintenance is a host task, not human input", () =>
-  withOpenClawTestState({ label: "maintenance-requester-grant" }, async ({ env }) => {
-    const { scope, schedule } = await setup(env, "maintenance-requester-grant");
-    const grantTarget = {
-      storeScope: scope.storePath,
-      agentId: scope.agentId,
-      sessionKey: scope.sessionKey,
-    };
-    const holders = () => readRequesterGrantHoldersForTest(grantTarget);
-    resetRequesterGrantsForTest();
-    enableRequesterGrantForTest({
-      holderProfileId: "alice",
-      target: grantTarget,
-      mode: "full-session",
-    });
-    // The holder's own turn: Alice's channel message, reserved by real reply ingress.
-    const alice = createAdmittedRunOperatorAuthority({
-      profileId: "alice",
-      scopes: [],
-      assertCurrent: () => {},
-    });
-    const prepared = await prepareReplySourceInput(
-      { SessionKey: scope.sessionKey },
-      { session: { store: scope.storePath } },
-      { operatorAuthority: alice },
-    );
-    const aliceRun = createQueueTestRun(
-      { prompt: "hi", operatorAuthority: alice },
-      { agentId: scope.agentId, sessionKey: scope.sessionKey },
-    );
-    bindReplySourceToFollowup(prepared.options, aliceRun);
-    const aliceClaim = await claimSessionControllerInput(aliceRun);
-    releaseSessionControllerClaim(aliceClaim);
-    await aliceClaim.settlement.promise;
-    expect(holders()).toEqual(["alice"]);
-
-    const flush = blockFlush();
-    try {
-      schedule();
-      await flush.started; // Maintenance's own session turn has been claimed.
-      expect(holders()).toEqual(["alice"]);
-    } finally {
-      flush.release();
-      await waitForSessionMaintenance(scope.sessionKey);
-      resetRequesterGrantsForTest();
-    }
-    expectEffects(1);
-  }));

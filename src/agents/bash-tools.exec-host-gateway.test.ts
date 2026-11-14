@@ -1412,12 +1412,7 @@ describe("processGatewayAllowlist", () => {
     expectNoCalls(commitAuthorizationMock, runExecProcessMock, followupMock);
   });
 
-  it.each([
-    "none",
-    "holder-disables",
-    "other-sender-steer",
-    "other-sender-queued-followup",
-  ] as const)(
+  it.each(["none", "holder-disables"] as const)(
     "8: resolves requester grants only at the deferred launch (during the wait: %s)",
     async (revocation) => {
       const grants = await import("./requester-grants.js");
@@ -1429,11 +1424,7 @@ describe("processGatewayAllowlist", () => {
       grants.setRequesterGrantValueProviderForTest({
         readEntries: () => ({ VAULT_TEST_TOKEN: value }),
       });
-      grants.enableRequesterGrantForTest({
-        holderProfileId: "alice",
-        target,
-        mode: "full-session",
-      });
+      grants.enableRequesterGrantForTest({ holderProfileId: "alice", target });
       const operatorAuthority = (profileId: string) =>
         createAdmittedRunOperatorAuthority({ profileId, scopes: [], assertCurrent: () => {} });
       const approval = createDeferredCore<ExecApprovalDecision>();
@@ -1482,67 +1473,14 @@ describe("processGatewayAllowlist", () => {
           }),
       );
       await vi.waitFor(() => expect(approvalDecisionMock).toHaveBeenCalledOnce());
-      const mailbox = await import("../sessions/session-controller.mailbox.js");
-      const sessionTarget = (
-        await import("../sessions/session-controller.target.js")
-      ).captureSessionTarget({
-        storeScope,
-        sessionKey,
-        agentId: "main",
-      });
-      const bobInputs: Array<ReturnType<typeof mailbox.reserveSessionControllerSource>> = [];
-      const bobCleanups: Array<() => void> = [];
       if (revocation === "holder-disables") {
-        grants.disableRequesterGrant(target, "alice");
-      } else if (revocation === "other-sender-steer") {
-        // A dashboard chat.send steer: the real RPC source reservation.
-        const { registerChatAbortController } = await import("../gateway/chat-abort.js");
-        const registration = registerChatAbortController({
-          target: sessionTarget,
-          sessionKey,
-          sessionId: "approval-grant-session",
-          runId: `bob-steer-${crypto.randomUUID()}`,
-          timeoutMs: 60_000,
-          policy: { mode: "steer" },
-        });
-        if (!registration.registered) {
-          throw new Error("steer was not registered");
-        }
-        bobCleanups.push(registration.cleanup);
-        // retainGatewayOperatorRun records the verified sender.
-        registration.entry.adapter.requesterProfileId = "bob";
-        const injection = mailbox.beginSessionControllerSourceInjection(registration.entry.input);
-        expect(await injection.admit()).toBe(true);
-        injection.finish(true);
-      } else if (revocation === "other-sender-queued-followup") {
-        // A channel follow-up reserved by real reply ingress; its turn never starts here.
-        const { createQueueTestRun } = await import("../auto-reply/reply/queue.test-helpers.js");
-        const { bindReplySourceToFollowup, prepareReplySourceInput } =
-          await import("../auto-reply/reply/reply-source-binding.js");
-        const bobAuthority = operatorAuthority("bob");
-        const prepared = await prepareReplySourceInput(
-          { SessionKey: sessionKey },
-          { session: { store: storeScope } },
-          { operatorAuthority: bobAuthority },
-        );
-        bobInputs.push(prepared.input!);
-        bindReplySourceToFollowup(
-          prepared.options,
-          createQueueTestRun({ prompt: "later", operatorAuthority: bobAuthority }),
-        );
+        grants.disableRequesterGrant(target);
       }
       approval.resolve("allow-once");
       await vi.waitFor(() => expect(spawned).toHaveLength(1));
       await waitForFollowup();
 
-      const delivered = revocation === "none" || revocation === "other-sender-queued-followup";
-      expect(spawned[0]?.VAULT_TEST_TOKEN).toBe(delivered ? value : undefined);
-      for (const input of bobInputs) {
-        mailbox.retireSessionControllerInput(input);
-      }
-      for (const cleanup of bobCleanups) {
-        cleanup();
-      }
+      expect(spawned[0]?.VAULT_TEST_TOKEN).toBe(revocation === "none" ? value : undefined);
       for (const [name, surface] of Object.entries({
         approvalRequests: gatewayMock.mock.calls,
         warnings,

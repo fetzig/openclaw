@@ -313,10 +313,8 @@ export async function steerSessionControllerOperation(params: {
   text: string;
   options: ReplyMessageInjectionOptions;
   abortOnUnconfirmedTranscript?: false;
-  /** Another session's input: human ingress from this host-captured sender (undefined: unverified). */
-  requesterGrantSender?: Readonly<{ profileId: string | undefined }>;
 }): Promise<SessionControllerSteerResult> {
-  const { operation, requesterGrantSender, ...steer } = params;
+  const { operation, ...steer } = params;
   const target = captureReplyMessageInjectionTarget(operation);
   if (!operation || !target) {
     const live = operation && isCurrentSessionControllerOperation(operation) && !operation.result;
@@ -326,12 +324,6 @@ export async function steerSessionControllerOperation(params: {
   const input = reserveSessionControllerSource(owner.id, {
     policy: { mode: "steer" },
     target: owner.target,
-    // Talk, TUI and inter-session steers are human input; plugin steers are not.
-    adapter: requesterGrantSender
-      ? { humanIngress: true, requesterProfileId: requesterGrantSender.profileId }
-      : steer.options.isInboundUserMessage
-        ? { humanIngress: true }
-        : undefined,
   });
   try {
     return await submitSessionControllerSteer({ ...steer, input, target });

@@ -5,7 +5,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, expect, it } from "vitest";
 import {
   enableRequesterGrantForTest,
@@ -21,15 +20,12 @@ import {
   resetLogger,
   setLoggerOverride,
 } from "../../../../src/logging/logger.js";
-import { createDeferred } from "../../../helpers/promise.js";
 import {
   BOB,
   replyText,
   roleTexts,
-  userTexts,
   withPeopleGateway,
   writeToolCall,
-  type ProviderRequest,
   type SteeringSession,
 } from "./gateway-session-steering.test-support.js";
 
@@ -65,11 +61,7 @@ async function prepare(gateway: People) {
     agentId: "main",
     sessionKey: session.sessionKey,
   };
-  enableRequesterGrantForTest({ holderProfileId: profile.id, target, mode: "full-session" });
-  // A decoy for the same agent and key in another store. It must outlive Bob's input, which
-  // shows the breaker revoked by the session's own store rather than in every store.
-  const decoy = { ...target, storeScope: `${target.storeScope}.other-store` };
-  enableRequesterGrantForTest({ holderProfileId: profile.id, target: decoy, mode: "full-session" });
+  enableRequesterGrantForTest({ holderProfileId: profile.id, target });
   const logs: unknown[] = [];
   setLoggerOverride({ level: "trace", consoleLevel: "silent" });
   getLogger().attachTransport((record) => void logs.push(record));
@@ -88,7 +80,6 @@ async function prepare(gateway: People) {
     hash,
     session,
     holders: () => readRequesterGrantHoldersForTest(target),
-    decoyHolders: () => readRequesterGrantHoldersForTest(decoy),
     profileId: profile.id,
     /** The value may reach only the spawned process: never chat, events, model, logs or disk. */
     expectNoLeak: async () => {
@@ -138,22 +129,17 @@ function probeOutputs(session: SteeringSession): string[] {
     );
 }
 
-const hasProbeOutput = (request: ProviderRequest, count: number) =>
-  request.input.filter((item) => item.type === "function_call_output").length >= count;
-
 it(
-  "delivers Alice's value to her own turn and not to her turn after Bob's message",
+  "delivers Alice's value to her own turn and to Bob's turn in her session",
   { timeout: TEST_TIMEOUT_MS },
   () =>
     withPeopleGateway({ exec: { mode: "full" } }, async (gateway) => {
-      const { hash, session, holders, decoyHolders, profileId, expectNoLeak } =
-        await prepare(gateway);
+      const { hash, session, holders, profileId, expectNoLeak } = await prepare(gateway);
       gateway.model.script(
         async (_request, response) => writeToolCall(response, "exec", { command: PROBE }),
-        async (_request, response) => replyText(response, "Alice's first check ran."),
-        async (_request, response) => replyText(response, "Bob's turn answered."),
+        async (_request, response) => replyText(response, "Alice's check ran."),
         async (_request, response) => writeToolCall(response, "exec", { command: PROBE }),
-        async (_request, response) => replyText(response, "Alice's second check ran."),
+        async (_request, response) => replyText(response, "Bob's check ran."),
       );
 
       const first = await session.send("Alice runs the vault check.");
@@ -161,76 +147,12 @@ it(
       expect(holders()).toHaveLength(1);
 
       const bob = await gateway.connectAs(BOB);
-      const bobTurn = await session.send("Bob asks something in Alice's session.", bob);
+      const bobTurn = await session.send("Bob runs the vault check in Alice's session.", bob);
       expect(await session.wait(bobTurn.runId)).toMatchObject({ status: "ok" });
-      expect(holders()).toEqual([]);
-      expect(decoyHolders()).toEqual([profileId]);
+      expect(holders()).toEqual([profileId]);
 
-      const second = await session.send("Alice runs the vault check again.");
-      expect(await session.wait(second.runId)).toMatchObject({ status: "ok" });
-
-      expect(probeOutputs(session)).toEqual([`vault:present:${hash}`, "vault:absent"]);
-      expect(roleTexts(await session.history(), "assistant")).toContain(
-        "Alice's second check ran.",
-      );
+      expect(probeOutputs(session)).toEqual([`vault:present:${hash}`, `vault:present:${hash}`]);
+      expect(roleTexts(await session.history(), "assistant")).toContain("Bob's check ran.");
       await expectNoLeak();
     }),
-);
-
-it(
-  "ends Alice's grant inside her running turn once Bob's steer is admitted",
-  { timeout: TEST_TIMEOUT_MS },
-  () =>
-    withPeopleGateway(
-      { allowCollaborativeSteering: true, exec: { mode: "full" } },
-      async (gateway) => {
-        const { hash, session, holders, decoyHolders, profileId, expectNoLeak } =
-          await prepare(gateway);
-        const bobText = "Bob steers Alice's running job.";
-        const afterFirstProbe = createDeferred();
-        const steerAdmitted = createDeferred();
-        let bobSeen = false;
-        gateway.model.script(
-          async (_request, response) => writeToolCall(response, "exec", { command: PROBE }),
-          // Holds the turn between two exec calls until Bob's steer has been admitted.
-          async (request, response) => {
-            expect(hasProbeOutput(request, 1)).toBe(true);
-            afterFirstProbe.resolve();
-            await steerAdmitted.promise;
-            writeToolCall(response, "exec", { command: PROBE });
-          },
-          async (request, response) => {
-            bobSeen = userTexts(request).some((text) => text.includes(bobText));
-            if (!bobSeen) {
-              writeToolCall(response, "session_status", {});
-              return "repeat";
-            }
-            replyText(response, "Alice's job finished with Bob's note.");
-            return undefined;
-          },
-        );
-
-        const run = await session.send("Alice starts the long vault job.");
-        await afterFirstProbe.promise;
-        expect(holders()).toHaveLength(1);
-        const bob = await gateway.connectAs(BOB);
-        const steered = await session.send(bobText, bob);
-        // The breaker trips when the running turn admits the steer, not when it consumes it.
-        const deadline = Date.now() + 20_000;
-        while (holders().length > 0 && Date.now() < deadline) {
-          await delay(25);
-        }
-        const revokedBeforeNextLaunch = holders().length === 0;
-        steerAdmitted.resolve();
-
-        expect(await session.wait(run.runId)).toMatchObject({ status: "ok" });
-        expect(revokedBeforeNextLaunch).toBe(true);
-        expect(decoyHolders()).toEqual([profileId]);
-        expect(bobSeen).toBe(true);
-        expect(session.executedRuns()).toEqual([run.runId]);
-        expect(session.executedRuns()).not.toContain(steered.runId);
-        expect(probeOutputs(session)).toEqual([`vault:present:${hash}`, "vault:absent"]);
-        await expectNoLeak();
-      },
-    ),
 );

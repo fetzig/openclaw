@@ -59,19 +59,6 @@ export async function retainGatewayOperatorRun(
   const signal = captured?.authority.signal;
   let partialSession: ReturnType<typeof retainChatAbortSessionSnapshot> | undefined;
   try {
-    if (params.entry && isRpcSourceRegistered(params.entry)) {
-      // Requester-grant breaker: the host's own system turn is a program turn;
-      // any other caller is human input from this verified sender.
-      const toolSender = params.client?.internal?.agentToolCaller?.requesterGrantSender;
-      if (params.systemTurn) {
-        params.entry.adapter.humanIngress = false;
-      } else if (toolSender) {
-        // An agent tool's input belongs to its run's operator, never the selected participant.
-        params.entry.adapter.requesterProfileId = toolSender.profileId;
-      } else if (captured) {
-        params.entry.adapter.requesterProfileId = captured.authority.profileId;
-      }
-    }
     if (
       !params.systemTurn &&
       captured &&

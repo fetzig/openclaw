@@ -1,4 +1,3 @@
-import { revokeOtherRequesterGrants } from "../agents/requester-grants.js";
 import type { FollowupQueueDisposition } from "../auto-reply/get-reply-options.types.js";
 /** Exact input identity and custody; scheduling remains with the mailbox selector. */
 import type { FollowupRun, QueueSettings } from "../auto-reply/reply/queue/types.js";
@@ -39,30 +38,6 @@ export function bindSessionControllerSource(
   input.source = source;
   source.controllerInput = input;
   notifyGatewayWorkMetricsChanged();
-}
-
-/**
- * A person's input from another sender ends every other holder's exec grant.
- * A steer trips this when admitted into the running turn; any other input when
- * its own turn claims it. Both share one custody flag, so it trips once per input.
- * An input withdrawn before either point never trips it. Classification is by
- * entry point: only reservations marked `humanIngress` count; host tasks never do.
- */
-export function tripRequesterGrantBreaker(input: SessionControllerInput): void {
-  if (input.custody.requesterGrantBreaker || !input.sourceAdapter?.humanIngress) {
-    return;
-  }
-  input.custody.requesterGrantBreaker = true;
-  const target = input.target ?? input.mailbox.owner.target;
-  revokeOtherRequesterGrants(
-    {
-      storeScope: target?.storeScope,
-      agentId: target?.agentId ?? input.source?.run.agentId,
-      sessionKey: target?.sessionKey ?? input.mailbox.key,
-    },
-    // Unknown sender: every grant in the session ends.
-    input.source?.operatorAuthority?.profileId ?? input.sourceAdapter?.requesterProfileId,
-  );
 }
 
 export function isSessionControllerSourceQueued(input: SessionControllerInput): boolean {
@@ -202,7 +177,6 @@ export function beginSessionControllerSourceInjection(
         input.abortSignal.throwIfAborted();
         started = true;
         pending.admitted = true;
-        tripRequesterGrantBreaker(input);
         logSessionControllerPhase({
           ...diagnosticIdentity,
           phase: "injection-outcome",

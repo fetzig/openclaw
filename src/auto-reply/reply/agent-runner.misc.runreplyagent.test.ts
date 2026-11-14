@@ -4,15 +4,9 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { describe, expect, it, vi } from "vitest";
 import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
-import { createAdmittedRunOperatorAuthority } from "../../agents/admitted-run-context.js";
 import type { RunEmbeddedAgentInternalParams } from "../../agents/embedded-agent-runner/run/internal-params.js";
 import { registerPendingAgentQuestion } from "../../agents/harness/gateway-question.js";
 import { modelDefinition, providerConfig } from "../../agents/model-auth.fixtures.test-support.js";
-import {
-  enableRequesterGrantForTest,
-  readRequesterGrantHoldersForTest,
-  resetRequesterGrantsForTest,
-} from "../../agents/requester-grants.js";
 import {
   beginForegroundSessionMaintenance,
   waitForSessionMaintenance,
@@ -27,7 +21,6 @@ import {
 import { createUsageFixture } from "../../agents/test-helpers/usage-fixtures.js";
 import type { NormalizedUsage } from "../../agents/usage.js";
 import { setRuntimeConfigSnapshot, type OpenClawConfig } from "../../config/config.js";
-import { resolveSessionStorePathCore } from "../../config/sessions/paths.js";
 import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import { SESSION_TOTAL_TOKENS_VERSION } from "../../config/sessions/types.js";
 import { settlePendingFinalDelivery } from "../../infra/outbound/delivery-completion.js";
@@ -1239,35 +1232,3 @@ it.each(["completed", "failed", "hidden"] as const)(
     expect(order).toEqual(outcome === "hidden" ? ["final"] : ["visible-work", "final"]);
   },
 );
-
-describe("runReplyAgent requester-grant breaker", () => {
-  it("counts a reply turn without a prepared reply source as human input", async () => {
-    // A channel context without SessionKey reserves nothing at prepareReplySourceInput;
-    // runReplyAgent reserves the turn itself, and that reservation is still a person's message.
-    const target = {
-      // createBaseRun configures no store, so the reply turn uses the agent's default store.
-      storeScope: resolveSessionStorePathCore(undefined, { agentId: "main" }),
-      agentId: "main",
-      sessionKey: "agent:main:grant-unprepared",
-    };
-    resetRequesterGrantsForTest();
-    enableRequesterGrantForTest({ holderProfileId: "alice", target, mode: "full-session" });
-    try {
-      const { run, followupRun } = createBaseRun({
-        run: { agentId: target.agentId, sessionKey: target.sessionKey },
-        followup: {
-          operatorAuthority: createAdmittedRunOperatorAuthority({
-            profileId: "bob",
-            scopes: [],
-            assertCurrent: () => {},
-          }),
-        },
-      });
-      await run();
-      expect(followupRun.controllerInput?.custody.requesterGrantBreaker).toBe(true);
-      expect(readRequesterGrantHoldersForTest(target)).toEqual([]);
-    } finally {
-      resetRequesterGrantsForTest();
-    }
-  });
-});

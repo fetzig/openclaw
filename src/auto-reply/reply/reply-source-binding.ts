@@ -67,15 +67,6 @@ export function readReplySourceInput(
   return direct[replySource] ?? lifecycle?.[replySource];
 }
 
-/** A reply turn is a person's message unless a host producer (session event, schedule) owns it. */
-export function isReplyHumanIngress(
-  options:
-    | Pick<InternalGetReplyOptions, "internalEventExecution" | "scheduledAutomation">
-    | undefined,
-): boolean {
-  return !options?.internalEventExecution && !options?.scheduledAutomation;
-}
-
 /** Capture only an actual physical source scope, before asynchronous preparation. */
 export async function prepareReplySourceInput(
   ctx: MsgContext,
@@ -129,8 +120,6 @@ export async function prepareReplySourceInput(
     adapter: {
       signal,
       authority: options?.operatorAuthority,
-      requesterProfileId: options?.operatorAuthority?.profileId,
-      humanIngress: isReplyHumanIngress(options),
     },
   });
   prepared.abortSignal = input.abortSignal;

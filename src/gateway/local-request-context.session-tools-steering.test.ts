@@ -7,12 +7,6 @@ import {
   registerTestEmbeddedRun,
 } from "../agents/embedded-agent-runner/runs.test-support.js";
 import {
-  enableRequesterGrantForTest,
-  readRequesterGrantHoldersForTest,
-  resetRequesterGrantsForTest,
-} from "../agents/requester-grants.js";
-import {
-  getGatewayToolCallerIdentity,
   withGatewayToolCallerIdentity,
   withoutGatewayToolCallerIdentity,
 } from "../agents/tools/gateway-caller-context.js";
@@ -409,69 +403,4 @@ describe("runtime-only session authority", () => {
       }
     });
   });
-});
-
-describe("sessions_send steer: requester-grant sender", () => {
-  afterEach(drainSessionToolsFixture);
-
-  it.each(["holder", "other operator", "no operator"] as const)(
-    "a steer from the %s ends the target's grant unless the sending run's operator holds it",
-    async (sender) => {
-      await withParticipantSessionToolsFixture(async ({ cfg, alice }) => {
-        // The sending turn's admitted operator is Alice.
-        const grantTarget = {
-          storeScope: sessionToolsStorePath(cfg),
-          agentId: "main",
-          sessionKey: PARTICIPANT_SHARED,
-        };
-        resetRequesterGrantsForTest();
-        const holder = sender === "other operator" ? "grant-holder" : alice.profileId;
-        enableRequesterGrantForTest({
-          holderProfileId: holder,
-          target: grantTarget,
-          mode: "full-session",
-        });
-        try {
-          await withDelayedSessionToolsSteering(cfg, async (receiver) => {
-            const requesterOrigin = getGatewayToolCallerIdentity()?.requesterOrigin;
-            const execute = () =>
-              createSessionsSendTool({ config: cfg, agentSessionKey: REQUESTER }).execute(
-                "grant-steer",
-                {
-                  sessionKey: PARTICIPANT_SHARED,
-                  message: "Use the updated requirements",
-                  mode: "steer",
-                  timeoutSeconds: 0,
-                },
-              );
-            const sent =
-              sender === "no operator"
-                ? withoutGatewayToolCallerIdentity(() =>
-                    withGatewayToolCallerIdentity(
-                      { agentId: "main", sessionKey: REQUESTER, requesterOrigin },
-                      execute,
-                    ),
-                  )
-                : execute();
-            await Promise.race([
-              receiver.waitForAccepted(),
-              sent.then((result) => {
-                throw new Error(
-                  `Steer settled before admission: ${JSON.stringify(result.details)}`,
-                );
-              }),
-            ]);
-            // A steer revokes when admitted, before the receiving turn commits it.
-            expect(readRequesterGrantHoldersForTest(grantTarget)).toEqual(
-              sender === "holder" ? [holder] : [],
-            );
-            await receiver.commit();
-            expect((await sent).details).toMatchObject({ status: "accepted" });
-          });
-        } finally {
-          resetRequesterGrantsForTest();
-        }
-      });
-    },
-  );
 });

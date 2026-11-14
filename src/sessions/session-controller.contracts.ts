@@ -513,8 +513,6 @@ export type SessionControllerSourceCustody = {
   rpcAdopted?: boolean;
   /** The Gateway accepted this source into its protocol run registry. */
   rpcAccepted?: boolean;
-  /** The requester-grant breaker ran for this input (steer admit or turn claim); once. */
-  requesterGrantBreaker?: true;
 };
 
 export type SessionControllerInput = {
@@ -631,13 +629,6 @@ export type SessionControllerMailbox = {
 export type SessionControllerSourceAdapter = {
   /** Original personal ingress, bound at admission; identity evidence, not an execution grant. */
   initiatingPersonalOperator?: AdmittedRunOperatorAuthority;
-  /** Verified sender captured at admission; only used to end other holders' exec grants. */
-  requesterProfileId?: string;
-  /**
-   * A person's input entered here (channel, chat.send, Gateway RPC client, talk, steer).
-   * Only such input ends other holders' exec grants; host-produced turns never do.
-   */
-  humanIngress?: boolean;
   readonly scope?: string;
   readonly authority?: { assertCurrent(): void; signal?: AbortSignal };
   readonly signal?: AbortSignal;
