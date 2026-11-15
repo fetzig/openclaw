@@ -88,12 +88,18 @@ export type SessionSecretValueProvider = {
 export type SessionSecretsLaunch = Readonly<{
   /** The session controller target of the turn that ran the tool; absent outside a session turn. */
   target?: SessionSecretsTarget;
-  /** Names owned by OpenClaw or set for this call (per-call or plugin env); never values. */
-  reservedKeys?: readonly string[];
+  /** Names OpenClaw sets for this command (prepared, routing and git-policy env); never values. */
+  ownedKeys?: readonly string[];
+  /** Names set for this call by per-call or plugin env; never values. */
+  overrideKeys?: readonly string[];
 }>;
 
-const MAX_ENTRIES = 64;
-/** OpenClaw-owned names that session secrets can never set, even when no reserved key covers them. */
+/** One vault takes at most 48 of the shared 512-slot log-redaction registry (up to 3 per value). */
+const MAX_ENTRIES = 16;
+/** Fixed text: a provider's or the profile catalog's error may carry detail no result should show. */
+const UNAVAILABLE_WARNING =
+  "Warning: session secrets were not provided to this command because they could not be read.";
+/** OpenClaw-owned names that session secrets can never set, even when no owned key covers them. */
 const OPENCLAW_OWNED_NAMES = new Set(["GH_TOKEN", "GITHUB_TOKEN", "PATH", "HOME"]);
 
 const state = resolveGlobalSingleton(Symbol.for("openclaw.sessionSecrets"), () => ({
@@ -357,14 +363,16 @@ function allowedHostsOf(entry: SessionSecretEntry): string[] | undefined {
 }
 
 /** Captures the physical session the current turn runs in, from its session controller entry. */
-export function captureSessionSecretsLaunch(reservedKeys: readonly string[]): SessionSecretsLaunch {
+export function captureSessionSecretsLaunch(
+  keys: Pick<SessionSecretsLaunch, "ownedKeys" | "overrideKeys">,
+): SessionSecretsLaunch {
   const owner = getCurrentSessionControllerOwner();
   const target =
     owner && isCurrentSessionControllerOperation(owner)
       ? getSessionControllerEntryForOperation(owner).target
       : undefined;
   return {
-    reservedKeys,
+    ...keys,
     ...(target
       ? {
           target: {
@@ -407,35 +415,65 @@ export async function resolveSessionSecretsLaunch(
     return undefined;
   }
   const provider = state.provider;
-  // Checked before anything is read: like a creator without entries, silently nothing.
-  const source = provider ? await resolveSessionSecretsSource(currentConfig(), target) : undefined;
-  const creatorProfileId = source && "creatorProfileId" in source ? source.creatorProfileId : "";
-  if (!provider || !creatorProfileId) {
+  if (!provider) {
     return undefined;
   }
   const unsupported = launch.sandbox ? "sandbox" : launch.durable ? "durable" : undefined;
-  if (unsupported) {
-    // A creator without entries gets nothing and no notice.
-    if ((await provider.listNames(creatorProfileId)).length > 0) {
-      launch.warnings.push(
-        `Session secrets were not provided to this command: ${unsupported} exec is not supported.`,
-      );
+  let entries: readonly SessionSecretEntry[];
+  try {
+    // Checked before anything is read: like a creator without entries, silently nothing.
+    const source = await resolveSessionSecretsSource(currentConfig(), target);
+    if (!source || !("creatorProfileId" in source)) {
+      return undefined;
     }
+    if (unsupported) {
+      // A creator without entries gets nothing and no notice.
+      if ((await provider.listNames(source.creatorProfileId)).length > 0) {
+        launch.warnings.push(
+          `Session secrets were not provided to this command: ${unsupported} exec is not supported.`,
+        );
+      }
+      return undefined;
+    }
+    entries = await provider.readEntries(source.creatorProfileId);
+  } catch {
+    // A failing creator lookup or provider fails closed, as the session read and the binding
+    // query do, and the command still runs.
+    launch.warnings.push(UNAVAILABLE_WARNING);
     return undefined;
   }
-  const entries = await provider.readEntries(creatorProfileId);
   if (entries.length === 0) {
     return undefined;
   }
   const proxyActive = isSecretEgressProxyActive();
-  const reserved = new Set(launch.sessionSecrets?.reservedKeys?.map((name) => name.toUpperCase()));
+  const upperSet = (names: readonly string[] = []) =>
+    new Set(names.map((name) => name.toUpperCase()));
+  const owned = upperSet(launch.sessionSecrets?.ownedKeys);
+  const overridden = upperSet(launch.sessionSecrets?.overrideKeys);
   const env: Record<string, string> = {};
   const bindings: SecretEgressSentinelBinding[] = [];
   const rejected: string[] = [];
+  const reject = (name: string, reason: string) =>
+    rejected.push(
+      ENV_SECRET_REF_ID_RE.test(name) ? `${name} (${reason})` : "one entry with an invalid name",
+    );
   const withheld: string[] = [];
+  const skipped: string[] = [];
+  // A name the provider returns twice is ambiguous: none of its entries is delivered.
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const { name } of entries) {
+    (seen.has(name) ? duplicates : seen).add(name);
+  }
+  for (const name of duplicates) {
+    reject(name, "duplicate name");
+  }
   let count = 0;
   for (const entry of entries) {
     const { name, value } = entry;
+    if (duplicates.has(name)) {
+      continue;
+    }
     const kind = entry.kind ?? "secret";
     const allowedHosts = kind === "secret" ? allowedHostsOf(entry) : undefined;
     const reason =
@@ -443,13 +481,16 @@ export async function resolveSessionSecretsLaunch(
       (kind === "secret" && !allowedHosts ? "no valid allowed hosts" : undefined) ??
       (++count > MAX_ENTRIES ? "too many" : undefined);
     if (reason) {
-      rejected.push(
-        ENV_SECRET_REF_ID_RE.test(name) ? `${name} (${reason})` : "one entry with an invalid name",
-      );
+      reject(name, reason);
       continue;
     }
-    // OpenClaw-set, per-call and plugin values win over session secrets.
-    if (reserved.has(name.toUpperCase())) {
+    // OpenClaw-set values win over session secrets, and the creator is told.
+    if (owned.has(name.toUpperCase())) {
+      skipped.push(name);
+      continue;
+    }
+    // Per-call and plugin values win silently, as they do over team-store entries.
+    if (overridden.has(name.toUpperCase())) {
       continue;
     }
     if (kind === "env") {
@@ -467,6 +508,11 @@ export async function resolveSessionSecretsLaunch(
   if (rejected.length > 0) {
     launch.warnings.push(
       `Warning: session secret entries were not provided: ${rejected.toSorted().join(", ")}.`,
+    );
+  }
+  if (skipped.length > 0) {
+    launch.warnings.push(
+      `Warning: session secret entries were not provided because OpenClaw sets these names for this command: ${skipped.toSorted().join(", ")}.`,
     );
   }
   if (withheld.length > 0) {

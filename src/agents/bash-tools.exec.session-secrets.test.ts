@@ -56,7 +56,10 @@ import {
   writeSession,
 } from "./bash-tools.exec.session-secrets.test-support.js";
 import { createOperationalRunInstanceRef } from "./operational-run-instance.js";
-import { readSessionSecretsStatus } from "./session-secrets.js";
+import {
+  readSessionSecretsStatus,
+  setSessionSecretValueProviderForTest,
+} from "./session-secrets.js";
 
 const mocks = vi.hoisted(() => ({
   hookRunner: undefined as
@@ -73,6 +76,8 @@ const mocks = vi.hoisted(() => ({
   /** PTY construction fails before launch, so runExecProcess retries without a PTY. */
   failPty: false,
   storeBindings: new Map<string, SessionBindingRecord[]>(),
+  /** The profile catalog is not ready, so creator lookups throw. */
+  failProfileCatalog: false,
 }));
 
 // mock-isolation: Each test installs its own plugin hooks instead of the global registry.
@@ -124,7 +129,36 @@ vi.mock("../process/supervisor/index.js", () => ({
   }),
 }));
 
+// mock-isolation: One test makes creator lookups throw as an unprepared profile catalog does.
+vi.mock("../state/user-profile-list.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../state/user-profile-list.js")>();
+  return {
+    ...actual,
+    readResidentUserProfileIdentity: (
+      ...args: Parameters<typeof actual.readResidentUserProfileIdentity>
+    ) => {
+      if (mocks.failProfileCatalog) {
+        throw new Error("User profile catalog is not ready");
+      }
+      return actual.readResidentUserProfileIdentity(...args);
+    },
+  };
+});
+
 installSessionSecretsHarness(mocks);
+
+const UNAVAILABLE =
+  "Warning: session secrets were not provided to this command because they could not be read.";
+/** A provider whose given method fails with an error that carries detail and the value. */
+function failingProvider(method: "listNames" | "readEntries") {
+  const fail = () => {
+    throw new Error(`vault backend unavailable: ${value}`);
+  };
+  setSessionSecretValueProviderForTest({
+    listNames: method === "listNames" ? fail : () => [{ name: KEY, kind: "env" }],
+    readEntries: method === "readEntries" ? fail : () => [{ name: KEY, kind: "env", value }],
+  });
+}
 
 describe("whose secrets a session uses", () => {
   type Name = "alice" | "bob";
@@ -738,6 +772,119 @@ describe("session secrets at launch", () => {
     expect(env[KEY]).toBe(registered[1]![0]!.sentinel);
     expect(resolveSecretSentinel(env[KEY]!)).toBe(value);
     expectNoLeak({ ...surfaces, env });
+  });
+
+  it("a failing provider read delivers nothing, warns with fixed text and never shows the error", async () => {
+    failingProvider("readEntries");
+    mocks.failPty = true;
+    const { env, warnings, surfaces } = await launch(turn("bob"), { usePty: true });
+    mocks.failPty = false;
+    const result = await execToolInTurn(turn("bob"), { command: "echo ok" });
+
+    expect(env.BASE).toBe("1");
+    expect(env[KEY]).toBeUndefined();
+    // The PTY retry reuses the failed read: one warning, and the retry log has no provider text.
+    expect(warnings).toEqual([UNAVAILABLE, expect.stringContaining("retrying without PTY")]);
+    expect(mocks.spawnInputs.at(-1)?.env?.[KEY]).toBeUndefined();
+    expect(JSON.stringify(result)).toContain(UNAVAILABLE);
+    for (const surface of [warnings, result, logs]) {
+      expect(JSON.stringify(surface)).not.toContain("vault backend unavailable");
+    }
+    expectNoLeak({ ...surfaces, result });
+  });
+
+  it("a failing name listing on an unsupported launch warns with fixed text only", async () => {
+    failingProvider("listNames");
+    const { env, warnings, surfaces } = await launch(turn("alice"), { sandbox } as never);
+
+    expect(env[KEY]).toBeUndefined();
+    expect(warnings).toEqual([UNAVAILABLE]);
+    expect(JSON.stringify(surfaces)).not.toContain("vault backend unavailable");
+    expectNoLeak(surfaces);
+  });
+
+  it("a failing creator lookup delivers nothing and warns with fixed text", async () => {
+    mocks.failProfileCatalog = true;
+    try {
+      const { env, warnings, surfaces } = await launch(turn("alice"));
+      expect(env.BASE).toBe("1");
+      expect(env[KEY]).toBeUndefined();
+      expect(warnings).toEqual([UNAVAILABLE]);
+      expect(JSON.stringify(surfaces)).not.toContain("not ready");
+      expect(providerCalls).toEqual([]);
+    } finally {
+      mocks.failProfileCatalog = false;
+    }
+    expect((await launch(turn("alice"))).env[KEY]).toBe(value);
+  });
+
+  it("an entry OpenClaw sets for the command is skipped with a warning; a per-call one silently", async () => {
+    entries(
+      { name: "GH_TOKEN", value: `gh-${value}`, allowedHosts: ["api.github.com"] },
+      { name: "CALL_KEY", kind: "env", value: `call-${value}` },
+      { name: KEY, kind: "env", value },
+    );
+    activateProxy();
+    const result = await execToolInTurn(
+      turn("bob"),
+      { command: "echo ok", env: { CALL_KEY: "per-call" } },
+      {
+        defaults: {
+          operationalRunInstance: createOperationalRunInstanceRef(`run-${randomUUID()}`),
+          // A managed GitHub identity scrubs the inherited GitHub tokens.
+          preparedRunEnvironment: {
+            credentialScrubEnv: { GH_TOKEN: "", GITHUB_TOKEN: "" },
+            localIdentityEnv: {},
+            excludedStoreNames: [],
+            managedLocalIdentity: true,
+          },
+        },
+      },
+    );
+
+    const env = mocks.spawnInputs.at(-1)?.env ?? {};
+    expect(env).toMatchObject({ GH_TOKEN: "", CALL_KEY: "per-call", [KEY]: value });
+    expect(registered.flat()).toEqual([]);
+    const text = JSON.stringify(result);
+    expect(text).toContain(
+      "Warning: session secret entries were not provided because OpenClaw sets these names for this command: GH_TOKEN.",
+    );
+    expect(text).not.toContain("CALL_KEY");
+    expectNoLeak({ result, logs });
+  });
+
+  it("a name the provider returns twice delivers none of its entries", async () => {
+    entries(
+      { name: "DUP", value: `s-${value}`, allowedHosts: ["api.example.test"] },
+      { name: "DUP", kind: "env", value: `e-${value}` },
+      { name: "DUP", value: `t-${value}`, allowedHosts: ["api.example.test"] },
+      { name: "OTHER", value, allowedHosts: ["api.example.test"] },
+    );
+    activateProxy();
+    const { env, warnings, surfaces } = await launch(turn("alice"));
+
+    expect(env.DUP).toBeUndefined();
+    expect(registered).toEqual([
+      [{ name: "OTHER", sentinel: env.OTHER, allowedHosts: ["api.example.test"] }],
+    ]);
+    expect(warnings).toEqual([
+      "Warning: session secret entries were not provided: DUP (duplicate name).",
+    ]);
+    expectNoLeak({ ...surfaces, env });
+  });
+
+  it("delivers at most 16 entries per person", async () => {
+    const names = Array.from({ length: 17 }, (_, index) => `CAP_${index + 1}`);
+    entries(...names.map((name) => ({ name, kind: "env" as const, value: `${name}-${value}` })));
+    const { env, warnings } = await launch(turn("alice"));
+
+    for (const name of names.slice(0, 16)) {
+      expect(env[name], name).toBe(`${name}-${value}`);
+    }
+    expect(env.CAP_17).toBeUndefined();
+    expect(warnings).toEqual([
+      "Warning: session secret entries were not provided: CAP_17 (too many).",
+    ]);
   });
 
   it("invalid, reserved, NUL and oversize entries are rejected by name only", async () => {

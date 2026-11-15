@@ -437,8 +437,10 @@ export function resolvePreparedExecEnvironment(params: {
 }): {
   env: Record<string, string>;
   requestedEnv?: Record<string, string>;
-  /** Names session secrets may not set at launch; names only, never values. */
-  reservedKeys: string[];
+  /** Names OpenClaw sets for the command; session secrets yield to them with a warning. */
+  ownedKeys: string[];
+  /** Per-call and plugin env names; session secrets yield to them silently. */
+  overrideKeys: string[];
   executionContext?: SystemRunExecutionContext;
 } {
   if (params.localProcessEnv && params.host !== "gateway") {
@@ -611,9 +613,10 @@ export function resolvePreparedExecEnvironment(params: {
 
   return {
     env: executionEnv,
-    reservedKeys: [explicitEnv, preparedEnv, routingEnv, gitPolicyEnv].flatMap((source) =>
+    ownedKeys: [preparedEnv, routingEnv, gitPolicyEnv].flatMap((source) =>
       Object.keys(source ?? {}),
     ),
+    overrideKeys: Object.keys(explicitEnv ?? {}),
     ...(params.host === "node" && routingEnv ? { executionContext } : {}),
     ...(params.host !== "node" && Object.keys(preparedEnv).length > 0
       ? { requestedEnv: { ...forwardedEnv, ...preparedEnv } }

@@ -423,7 +423,7 @@ export function createExecTool(defaults?: ExecToolDefaults) {
         if (useSecretEgress && !defaults?.operationalRunInstance) {
           throw new Error("Secret egress proxy requires an admitted agent run instance");
         }
-        const { env, requestedEnv, reservedKeys, executionContext } =
+        const { env, requestedEnv, ownedKeys, overrideKeys, executionContext } =
           resolvePreparedExecEnvironment({
             execParams: params,
             host,
@@ -437,7 +437,7 @@ export function createExecTool(defaults?: ExecToolDefaults) {
             ...preparedRunEnvironment,
             warnings,
           });
-        const sessionSecrets = captureSessionSecretsLaunch(reservedKeys);
+        const sessionSecrets = captureSessionSecretsLaunch({ ownedKeys, overrideKeys });
 
         const hostApprovalParams = () => ({
           approvalTransport,
